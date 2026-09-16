@@ -27,6 +27,10 @@ Requires Windows PowerShell 5.1 or later. No modules, no install.
   with the action's executable selected, or the task definition under
   `C:\Windows\System32\Tasks` if the file is gone), Copy task path, Copy command line,
   and **Delete task** (asks for confirmation; cannot be undone).
+- **Red rows** have a problem: the action's executable, DLL, or COM class no longer
+  exists, or the task name, folder, or run-as principal carries a SID that no longer
+  resolves to an account (a leftover from a deleted user). The Problem column says
+  which. **Only problems** filters to those rows.
 - **Export CSV** writes the full inventory.
 - The bottom pane shows details and the raw task XML for the selected row.
 

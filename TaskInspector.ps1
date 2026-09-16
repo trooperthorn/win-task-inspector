@@ -87,28 +87,56 @@ function Get-TriggerSummary {
 $script:ComCache = @{}
 function Resolve-ComHandler {
     # Direct .NET registry reads: the HKLM: provider is ~0.2s per miss under Classes\.
+    # Returns Path (DLL/EXE), Name, and Service when the class is hosted by a Windows
+    # service via its AppID (no in-process server; that is not a defect).
     param([string]$ClassId)
     if ($script:ComCache.ContainsKey($ClassId)) { return $script:ComCache[$ClassId] }
     $result = $null
+    $hklm = [Microsoft.Win32.Registry]::LocalMachine
     $roots = @(
-        @{ Hive = [Microsoft.Win32.Registry]::LocalMachine; Sub = 'SOFTWARE\Classes\CLSID\' },
-        @{ Hive = [Microsoft.Win32.Registry]::LocalMachine; Sub = 'SOFTWARE\WOW6432Node\Classes\CLSID\' },
-        @{ Hive = [Microsoft.Win32.Registry]::CurrentUser;  Sub = 'SOFTWARE\Classes\CLSID\' }
+        @{ Hive = $hklm; Sub = 'SOFTWARE\Classes\CLSID\' },
+        @{ Hive = $hklm; Sub = 'SOFTWARE\WOW6432Node\Classes\CLSID\' },
+        @{ Hive = [Microsoft.Win32.Registry]::CurrentUser; Sub = 'SOFTWARE\Classes\CLSID\' }
     )
     foreach ($r in $roots) {
         $key = $null
         try { $key = $r.Hive.OpenSubKey($r.Sub + $ClassId) } catch {}
         if ($null -eq $key) { continue }
         try {
+            $name = [string]$key.GetValue('')
             foreach ($server in 'InprocServer32', 'LocalServer32') {
                 $sk = $key.OpenSubKey($server)
                 if ($null -eq $sk) { continue }
                 $path = $sk.GetValue('')
                 $sk.Close()
                 if ($path) {
-                    $result = [pscustomobject]@{ Path = [Environment]::ExpandEnvironmentVariables([string]$path); Name = [string]$key.GetValue('') }
+                    $result = [pscustomobject]@{ Path = [Environment]::ExpandEnvironmentVariables([string]$path); Name = $name; Service = '' }
                     break
                 }
+            }
+            if (-not $result) {
+                # Service-hosted class: CLSID -> AppID -> LocalService -> service ImagePath
+                $appId = [string]$key.GetValue('AppID')
+                if ($appId) {
+                    $ak = $null
+                    try { $ak = $hklm.OpenSubKey('SOFTWARE\Classes\AppID\' + $appId) } catch {}
+                    if ($ak) {
+                        $svc = [string]$ak.GetValue('LocalService')
+                        $ak.Close()
+                        if ($svc) {
+                            $img = ''
+                            $svk = $null
+                            try { $svk = $hklm.OpenSubKey('SYSTEM\CurrentControlSet\Services\' + $svc) } catch {}
+                            if ($svk) { $img = [string]$svk.GetValue('ImagePath'); $svk.Close() }
+                            if ($img -match '^\s*"?([^"]+?\.exe)') { $img = $Matches[1] }
+                            $result = [pscustomobject]@{ Path = [Environment]::ExpandEnvironmentVariables($img); Name = $name; Service = $svc }
+                        }
+                    }
+                }
+            }
+            if (-not $result -and $name) {
+                # Registered but with no server we can find; report the name, do not flag
+                $result = [pscustomobject]@{ Path = ''; Name = $name; Service = '' }
             }
         } finally { $key.Close() }
         if ($result) { break }
@@ -157,6 +185,20 @@ function Get-Signer {
     return $ei.Signed
 }
 
+$script:SidCache = @{}
+$script:SidRegex = [regex]'S-1-\d+(?:-\d+){1,14}'
+function Test-SidResolves {
+    param([string]$Sid)
+    if ($script:SidCache.ContainsKey($Sid)) { return $script:SidCache[$Sid] }
+    $ok = $false
+    try {
+        $acct = (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount])
+        $ok = [bool]$acct
+    } catch { $ok = $false }
+    $script:SidCache[$Sid] = $ok
+    return $ok
+}
+
 function Get-TaskInventory {
     $rows = New-Object System.Collections.Generic.List[object]
     $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue
@@ -166,7 +208,7 @@ function Get-TaskInventory {
         $xml = ''
         try { $xml = Export-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch {}
 
-        $execs = @(); $argList = @(); $targets = @(); $publishers = @()
+        $execs = @(); $argList = @(); $targets = @(); $publishers = @(); $problems = @()
         foreach ($a in @($task.Actions)) {
             if ($null -eq $a) { continue }
             $aKind = $a.CimClass.CimClassName
@@ -177,21 +219,34 @@ function Get-TaskInventory {
                 if ($ei) {
                     if ($ei.Description) { $publishers += $ei.Description }
                     if ($ei.Publisher) { $publishers += $ei.Publisher }
-                    if (-not $ei.Exists) { $publishers += 'NOT FOUND' }
+                    if (-not $ei.Exists) { $publishers += 'NOT FOUND'; $problems += "missing file: $($a.Execute)" }
                 }
             } elseif ($aKind -eq 'MSFT_TaskComHandlerAction') {
                 $com = Resolve-ComHandler $a.ClassId
                 if ($com) {
-                    $execs += "[COM] $($com.Path)"
+                    if ($com.Service) { $execs += "[COM svc $($com.Service)] $($com.Path)" }
+                    elseif ($com.Path) { $execs += "[COM] $($com.Path)" }
+                    else { $execs += "[COM] $($com.Name) $($a.ClassId)" }
                     if ($com.Name) { $publishers += $com.Name }
-                    $ei = Get-ExeInfo $com.Path
-                    if ($ei -and $ei.Publisher) { $publishers += $ei.Publisher }
-                } else { $execs += "[COM] $($a.ClassId)" }
+                    if ($com.Path) {
+                        $ei = Get-ExeInfo $com.Path
+                        if ($ei -and $ei.Publisher) { $publishers += $ei.Publisher }
+                        if ($ei -and -not $ei.Exists) { $problems += "missing COM server: $($com.Path)" }
+                    }
+                } else { $execs += "[COM] $($a.ClassId)"; $problems += "unregistered COM class $($a.ClassId)" }
                 if ($a.Data) { $argList += $a.Data }
             } else {
                 $execs += "[$($aKind -replace '^MSFT_Task','')]"
             }
         }
+        # Unknown SIDs in the task name, folder, or run-as principal (leftovers from deleted accounts)
+        $sidSources = @($task.TaskName, $task.TaskPath, $task.Principal.UserId) | Where-Object { $_ }
+        foreach ($src in $sidSources) {
+            foreach ($m in $script:SidRegex.Matches($src)) {
+                if (-not (Test-SidResolves $m.Value)) { $problems += "unknown SID $($m.Value)" }
+            }
+        }
+        $problems = @($problems | Sort-Object -Unique)
         $argText = ($argList -join ' ')
         foreach ($m in $script:UrlRegex.Matches($argText + ' ' + $xml)) { if (-not $script:IgnoreUrl.IsMatch($m.Value)) { $targets += $m.Value } }
         foreach ($m in $script:HostRegex.Matches($argText)) { $targets += $m.Value }
@@ -224,7 +279,9 @@ function Get-TaskInventory {
             Publisher   = (@($publishers | Sort-Object -Unique) -join '; ')
             Accesses    = ($targets -join ', ')
             Description = $task.Description
-            ExePaths    = @($execs | ForEach-Object { $_ -replace '^\[COM\] ', '' } | Where-Object { $_ -notmatch '^\[' })
+            Problem     = ($problems -join '; ')
+            HasProblem  = ($problems.Count -gt 0)
+            ExePaths    = @($execs | ForEach-Object { $_ -replace '^\[COM[^\]]*\] ', '' } | Where-Object { $_ -and $_ -notmatch '^[\[{]' })
             Xml         = $xml
         })
     }
@@ -242,6 +299,7 @@ function Get-TaskInventory {
       <CheckBox x:Name="HideMs" Content="Hide \Microsoft\ tasks" VerticalAlignment="Center" Margin="0,0,8,0"/>
       <CheckBox x:Name="HideDisabled" Content="Hide disabled" VerticalAlignment="Center" Margin="0,0,8,0"/>
       <CheckBox x:Name="OnlyNet" Content="Only with URLs/hosts" VerticalAlignment="Center" Margin="0,0,8,0"/>
+      <CheckBox x:Name="OnlyProblems" Content="Only problems" VerticalAlignment="Center" Margin="0,0,8,0" Foreground="#C62828"/>
       <Separator/>
       <Button x:Name="Refresh" Content="Refresh" Margin="4,0"/>
       <Button x:Name="Disable" Content="Disable selected" Margin="4,0"/>
@@ -279,6 +337,11 @@ function Get-TaskInventory {
             <Style.Triggers>
               <DataTrigger Binding="{Binding State}" Value="Disabled"><Setter Property="Foreground" Value="Gray"/></DataTrigger>
               <DataTrigger Binding="{Binding State}" Value="Running"><Setter Property="Foreground" Value="DarkGreen"/></DataTrigger>
+              <DataTrigger Binding="{Binding HasProblem}" Value="True">
+                <Setter Property="Foreground" Value="White"/>
+                <Setter Property="Background" Value="#C62828"/>
+                <Setter Property="FontWeight" Value="SemiBold"/>
+              </DataTrigger>
             </Style.Triggers>
           </Style>
         </DataGrid.RowStyle>
@@ -286,6 +349,7 @@ function Get-TaskInventory {
           <DataGridTextColumn Header="Folder" Binding="{Binding Folder}" Width="200"/>
           <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="220"/>
           <DataGridTextColumn Header="State" Binding="{Binding State}" Width="70"/>
+          <DataGridTextColumn Header="Problem" Binding="{Binding Problem}" Width="220"/>
           <DataGridTextColumn Header="Last run" Binding="{Binding LastRun, StringFormat=yyyy-MM-dd HH:mm}" Width="120"/>
           <DataGridTextColumn Header="Result" Binding="{Binding LastResult}" Width="80"/>
           <DataGridTextColumn Header="Next run" Binding="{Binding NextRun, StringFormat=yyyy-MM-dd HH:mm}" Width="120"/>
@@ -314,7 +378,7 @@ function Get-TaskInventory {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $ui = @{}
-foreach ($n in 'Filter','HideMs','HideDisabled','OnlyNet','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
+foreach ($n in 'Filter','HideMs','HideDisabled','OnlyNet','OnlyProblems','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
 $cm = $ui.Grid.ContextMenu
 foreach ($item in $cm.Items) { if ($item.Name) { $ui[$item.Name] = $item } }
 $ui.HideMs.IsChecked = $true
@@ -327,10 +391,12 @@ function Apply-Filter {
     $hideMs = $ui.HideMs.IsChecked
     $hideDis = $ui.HideDisabled.IsChecked
     $onlyNet = $ui.OnlyNet.IsChecked
+    $onlyProb = $ui.OnlyProblems.IsChecked
     $filtered = $script:All | Where-Object {
         ($(if ($hideMs) { $_.Folder -notlike '\Microsoft\*' } else { $true })) -and
         ($(if ($hideDis) { $_.State -ne 'Disabled' } else { $true })) -and
         ($(if ($onlyNet) { [bool]$_.Accesses } else { $true })) -and
+        ($(if ($onlyProb) { $_.HasProblem } else { $true })) -and
         ($(if ($f) { ($_.Folder + $_.Name + $_.Action + $_.Arguments + $_.Publisher + $_.Accesses + $_.Triggers + $_.Author) -like "*$f*" } else { $true }))
     }
     $view = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
@@ -338,7 +404,8 @@ function Apply-Filter {
     $ui.Grid.ItemsSource = $view
     $note = ''
     if (-not $script:IsAdmin) { $note = '  (not elevated: SYSTEM tasks are read-only)' }
-    $ui.Status.Text = "$($view.Count) of $($script:All.Count) tasks$note"
+    $probCount = @($script:All | Where-Object HasProblem).Count
+    $ui.Status.Text = "$($view.Count) of $($script:All.Count) tasks, $probCount with problems$note"
 }
 
 function Load-Tasks {
@@ -377,6 +444,7 @@ $ui.Filter.Add_TextChanged({ Apply-Filter })
 $ui.HideMs.Add_Click({ Apply-Filter })
 $ui.HideDisabled.Add_Click({ Apply-Filter })
 $ui.OnlyNet.Add_Click({ Apply-Filter })
+$ui.OnlyProblems.Add_Click({ Apply-Filter })
 $ui.Disable.Add_Click({ Set-SelectedState -Enable:$false })
 $ui.Enable.Add_Click({ Set-SelectedState -Enable:$true })
 $ui.RunNow.Add_Click({
@@ -391,7 +459,7 @@ $ui.ExportCsv.Add_Click({
     $dlg.Filter = 'CSV|*.csv'
     $dlg.FileName = "scheduled-tasks-$(Get-Date -Format yyyyMMdd-HHmm).csv"
     if ($dlg.ShowDialog()) {
-        $script:All | Select-Object Folder,Name,State,LastRun,LastResult,NextRun,Triggers,Action,Arguments,Publisher,Accesses,RunAs,Author,Description |
+        $script:All | Select-Object Folder,Name,State,Problem,LastRun,LastResult,NextRun,Triggers,Action,Arguments,Publisher,Accesses,RunAs,Author,Description |
             Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
         $ui.Status.Text = "Exported to $($dlg.FileName)"
     }
@@ -465,6 +533,7 @@ $ui.Grid.Add_SelectionChanged({
     $ui.Details.Text = @(
         "Task:        $($r.Folder)$($r.Name)"
         "State:       $($r.State)    Run as: $($r.RunAs)    Author: $($r.Author)"
+        "Problem:     $($r.Problem)"
         "Last run:    $($r.LastRun)  ($($r.LastResult))"
         "Next run:    $($r.NextRun)"
         "Triggers:    $($r.Triggers)"
