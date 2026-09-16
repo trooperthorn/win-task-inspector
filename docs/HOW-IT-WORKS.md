@@ -13,8 +13,8 @@
 | Task history | Only if the target's `Microsoft-Windows-TaskScheduler/Operational` log is enabled. |
 
 The exe is about 115 KB. It is unsigned; SmartScreen may prompt when it is run from a
-download or network share. There is no installer and nothing is written outside the
-folder the exe is in, except CSV files you choose to export.
+download or network share. There is no installer. The only files it writes are CSV
+exports you ask for and the error log under `%LOCALAPPDATA%\TaskInspector`.
 
 ## What it can do
 
