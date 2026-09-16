@@ -704,7 +704,13 @@ $ui.ExportCsv.Add_Click({
     }
 })
 $ui.Elevate.Add_Click({
-    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`""
+    # When hosted by TaskInspector.exe the host sets $TaskInspectorExe; otherwise we are a plain script.
+    $exe = Get-Variable -Name TaskInspectorExe -ValueOnly -ErrorAction SilentlyContinue
+    if ($exe -and (Test-Path -LiteralPath $exe)) {
+        Start-Process -FilePath $exe -Verb RunAs
+    } else {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`""
+    }
     $window.Close()
 })
 # Right-click on a row selects it (keeps an existing multi-selection if the row is already in it)
