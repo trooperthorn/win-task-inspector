@@ -117,6 +117,16 @@ host avoids newer language features. Output goes to `dist\`, which is not commit
 the GitHub Actions workflow builds it on every push and publishes the exe as an
 artifact.
 
+### Logging
+
+`Write-Log` appends to `%LOCALAPPDATA%\TaskInspector\TaskInspector.log` with a timestamp,
+level (INFO, WARN, ERROR), message, the exception text, and the script line. It is
+called from every catch block that matters: connection attempts per protocol, per-task
+`Get-ScheduledTaskInfo` and `Export-ScheduledTask` failures, task actions, history
+lookups, headless export, the initial load, and an outer guard around the window. The
+C# host writes FATAL lines to the same file for errors that escape the runspace. The log
+rotates once at 2 MB.
+
 ## Known limits
 
 - "Accesses" is static: it lists URLs and hostnames written into the task definition,

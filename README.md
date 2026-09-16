@@ -64,16 +64,16 @@ only the user name is given; the password is prompted for in a secure dialog.
 
 - **Left pane** picks a view: all, enabled, disabled, running, or by trigger type
   (logon, startup, idle, schedule, event, on demand), plus Problems and Non-Microsoft.
-  Below it, **Task Scheduler Library** is the folder tree; selecting a folder shows its
-  tasks and every subfolder's tasks, combined with the view above. Counts in the tree
-  include subfolders. Drag the divider to resize the pane. Selecting a folder overrides
-  "Hide \Microsoft\ tasks".
+  Below it, **Task Scheduler Library** is the folder tree. Selecting a folder shows its
+  tasks and every subfolder's tasks by default; the vertical-dots button beside the
+  heading switches to showing only the selected folder, like Task Scheduler. Counts in
+  the tree include subfolders. Drag the divider to resize the pane.
 - **Properties** (right-click, or double-click a row) opens a read-only window with the
   same tabs as Task Scheduler: General, Triggers, Actions, Conditions, Settings,
   History (from the TaskScheduler/Operational log, if history is enabled), and XML.
 - Column sort order and the current selection survive Refresh and every action.
 - **Filter** matches folder, name, action, arguments, publisher, accesses, triggers, author.
-- **Hide \Microsoft\ tasks** is on by default; untick to see the full tree.
+- **Hide \Microsoft\ tasks** is an extra filter, off by default; the tree is the main scope.
 - **Only with URLs/hosts** narrows to tasks whose definition names a network target.
 - **Disable / Enable / Run now** act on the selected rows (multi-select with Ctrl/Shift).
   SYSTEM-owned tasks need an elevated session; use **Relaunch as Admin**.
@@ -99,6 +99,14 @@ only the user name is given; the password is prompted for in a secure dialog.
   result decoding, build).
 - The `build` workflow compiles the exe on every push and uploads it as an artifact;
   pushing a `v*` tag attaches it to a GitHub Release.
+
+## Error log
+
+Every failure is appended to `%LOCALAPPDATA%\TaskInspector\TaskInspector.log`: connection
+attempts and why they failed, per-task read errors, enable/disable/run/delete failures,
+history lookups, headless export errors, and any fatal error from the host. Each run adds
+a Start line with the user, elevation, PowerShell version, and arguments, and an Exit
+line. The file rotates to `.log.1` at 2 MB. The **Log** button on the toolbar opens it.
 
 ## Limits
 

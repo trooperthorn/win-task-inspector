@@ -46,6 +46,26 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
+# ---- Error log: %LOCALAPPDATA%\TaskInspector\TaskInspector.log (rotated at 2 MB) ----
+$script:LogDir = Join-Path $env:LOCALAPPDATA 'TaskInspector'
+$script:LogPath = Join-Path $script:LogDir 'TaskInspector.log'
+function Write-Log {
+    param([string]$Level, [string]$Message, $ErrorRecord = $null)
+    try {
+        if (-not (Test-Path -LiteralPath $script:LogDir)) { New-Item -ItemType Directory -Force $script:LogDir | Out-Null }
+        if ((Test-Path -LiteralPath $script:LogPath) -and (Get-Item -LiteralPath $script:LogPath).Length -gt 2MB) {
+            Move-Item -LiteralPath $script:LogPath -Destination ($script:LogPath + '.1') -Force
+        }
+        $line = '{0:yyyy-MM-dd HH:mm:ss} [{1,-5}] {2}' -f (Get-Date), $Level, $Message
+        if ($ErrorRecord) {
+            $line += ' :: ' + $ErrorRecord.Exception.Message.Trim()
+            if ($ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.ScriptLineNumber) { $line += " (line $($ErrorRecord.InvocationInfo.ScriptLineNumber))" }
+        }
+        Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
+    } catch {}
+}
+Write-Log 'INFO' "Start: user=$env:USERDOMAIN\$env:USERNAME admin=$script:IsAdmin ps=$($PSVersionTable.PSVersion) args=ComputerName='$ComputerName' Csv='$Csv'"
+
 # ---- Target: local by default, or a remote computer through a CIM session ----
 $script:Target = ''            # display name; '' = local
 $script:Cim = $null            # CimSession when remote
@@ -99,7 +119,7 @@ function Connect-Target {
                 foreach ($k in @($script:RemoteEnv.Keys)) { $script:RemoteEnv[$k] = Expand-TargetPath $script:RemoteEnv[$k] }
             } catch {}
             return ''
-        } catch { $errs += "$proto`: $($_.Exception.Message.Trim())" }
+        } catch { $errs += "$proto`: $($_.Exception.Message.Trim())"; Write-Log 'ERROR' "Connect $Name over $proto failed" $_ }
     }
     return ($errs -join "`n")
 }
@@ -441,12 +461,13 @@ function Get-ResultDetail {
 
 function Get-TaskInventory {
     $rows = New-Object System.Collections.Generic.List[object]
-    $tasks = Get-ScheduledTask @script:CimArgs -ErrorAction SilentlyContinue
+    $tasks = @()
+    try { $tasks = Get-ScheduledTask @script:CimArgs -ErrorAction Stop } catch { Write-Log 'ERROR' 'Get-ScheduledTask failed' $_ }
     foreach ($task in $tasks) {
         $info = $null
-        try { $info = Get-ScheduledTaskInfo @script:CimArgs -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch {}
+        try { $info = Get-ScheduledTaskInfo @script:CimArgs -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch { Write-Log 'WARN' "TaskInfo failed for $($task.TaskPath)$($task.TaskName)" $_ }
         $xml = ''
-        try { $xml = Export-ScheduledTask @script:CimArgs -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch {}
+        try { $xml = Export-ScheduledTask @script:CimArgs -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch { Write-Log 'WARN' "Export failed for $($task.TaskPath)$($task.TaskName)" $_ }
 
         $execs = @(); $argList = @(); $targets = @(); $publishers = @(); $problems = @()
         foreach ($a in @($task.Actions)) {
@@ -551,7 +572,7 @@ if ($Credential) { $script:StartCred = Get-Credential -UserName $Credential -Mes
 if ($Csv) {
     # Headless: connect, export, exit. Output goes to the parent console if there is one.
     $err = Connect-Target $ComputerName $script:StartCred
-    if ($err) { try { [Console]::Error.WriteLine("Cannot connect to $ComputerName`n$err") } catch {}; $global:TaskInspectorExit = 2; exit 2 }
+    if ($err) { Write-Log 'ERROR' "Headless: cannot connect to $ComputerName"; try { [Console]::Error.WriteLine("Cannot connect to $ComputerName`n$err`nSee $script:LogPath") } catch {}; $global:TaskInspectorExit = 2; exit 2 }
     try {
         $dir = Split-Path -Parent $Csv
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
@@ -561,7 +582,8 @@ if ($Csv) {
         try { [Console]::Out.WriteLine("Task Inspector: wrote $n tasks from $who to $Csv") } catch {}
         $global:TaskInspectorExit = 0; exit 0
     } catch {
-        try { [Console]::Error.WriteLine("Export failed: $($_.Exception.Message)") } catch {}
+        Write-Log 'ERROR' "Headless export to $Csv failed" $_
+        try { [Console]::Error.WriteLine("Export failed: $($_.Exception.Message)`nSee $script:LogPath") } catch {}
         $global:TaskInspectorExit = 1; exit 1
     }
 }
@@ -588,6 +610,7 @@ if ($Csv) {
       <Separator/>
       <Button x:Name="ExportCsv" Content="Export CSV" Margin="4,0"/>
       <Button x:Name="Elevate" Content="Relaunch as Admin" Margin="4,0"/>
+      <Button x:Name="OpenLog" Content="Log" Margin="4,0" ToolTip="Open the error log"/>
       <TextBlock x:Name="Status" VerticalAlignment="Center" Margin="12,0" Foreground="Gray"/>
     </ToolBar>
     <Grid>
@@ -620,7 +643,18 @@ if ($Csv) {
         <ListBoxItem Content="Problems" Tag="problems" Foreground="#C62828"/>
         <ListBoxItem Content="Non-Microsoft" Tag="nonms"/>
       </ListBox>
-      <TextBlock Grid.Row="2" Text="Task Scheduler Library" FontWeight="Bold" Margin="6,10,0,2"/>
+      <DockPanel Grid.Row="2" Margin="6,10,4,2" LastChildFill="True">
+        <Button x:Name="TreeMenu" DockPanel.Dock="Right" Content="&#x22EE;" Width="22" Height="22" Padding="0" FontSize="14" FontWeight="Bold"
+                ToolTip="Folder scope" Background="Transparent" BorderThickness="0">
+          <Button.ContextMenu>
+            <ContextMenu>
+              <MenuItem x:Name="ScopeAll" Header="Show tasks in this folder and all subfolders" IsCheckable="True" IsChecked="True"/>
+              <MenuItem x:Name="ScopeFolder" Header="Show only tasks in the selected folder" IsCheckable="True"/>
+            </ContextMenu>
+          </Button.ContextMenu>
+        </Button>
+        <TextBlock Text="Task Scheduler Library" FontWeight="Bold" VerticalAlignment="Center"/>
+      </DockPanel>
       <TreeView x:Name="Tree" Grid.Row="3" FontSize="13" BorderThickness="0"/>
     </Grid>
     <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Background="#DDD"/>
@@ -703,14 +737,15 @@ if ($Csv) {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $ui = @{}
-foreach ($n in 'Computer','Connect','Filter','HideMs','OnlyNet','Nav','Tree','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
+foreach ($n in 'Computer','Connect','Filter','HideMs','OnlyNet','Nav','Tree','TreeMenu','ScopeAll','ScopeFolder','OpenLog','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
 $cm = $ui.Grid.ContextMenu
 foreach ($item in $cm.Items) { if ($item -is [System.Windows.Controls.MenuItem] -and $item.Name) { $ui[$item.Name] = $item } }
-$ui.HideMs.IsChecked = $true
+$ui.HideMs.IsChecked = $false   # the folder tree is the primary scope; this is an extra filter
 if ($script:IsAdmin) { $ui.Elevate.IsEnabled = $false }
 
 $script:All = @()
 $script:FolderFilter = '\'
+$script:TreeScope = 'all'   # 'all' = folder + subfolders, 'folder' = selected folder only
 
 function Build-FolderTree {
     # One node per folder that exists in the task list (Task Scheduler Library layout);
@@ -764,7 +799,7 @@ function Apply-Filter {
     if ($ui.Nav.SelectedItem -and $ui.Nav.SelectedItem.Tag) { $nav = [string]$ui.Nav.SelectedItem.Tag }
     $filtered = $script:All | Where-Object {
         $row = $_
-        ($row.Folder -like ($script:FolderFilter + '*')) -and
+        ($(if ($script:TreeScope -eq 'folder') { $row.Folder -eq $script:FolderFilter } else { $row.Folder -like ($script:FolderFilter + '*') })) -and
         ($(if ($hideMs -and $nav -ne 'nonms' -and $script:FolderFilter -eq '\') { $row.Folder -notlike '\Microsoft\*' } else { $true })) -and
         ($(if ($onlyNet) { [bool]$row.Accesses } else { $true })) -and
         ($(switch ($nav) {
@@ -807,7 +842,7 @@ function Apply-Filter {
     if (-not $script:IsAdmin -and -not $script:Cim) { $note = '  (not elevated: SYSTEM tasks are read-only)' }
     if ($script:Cim) { $note = "  [remote: $($script:Target)]" }
     $probCount = @($script:All | Where-Object HasProblem).Count
-    $where = ''; if ($script:FolderFilter -ne '\') { $where = " in $($script:FolderFilter)" }
+    $where = ''; if ($script:FolderFilter -ne '\' -or $script:TreeScope -eq 'folder') { $where = " in $($script:FolderFilter)"; if ($script:TreeScope -eq 'folder') { $where += ' (this folder only)' } }
     $counts = "$($view.Count) of $($script:All.Count) tasks$where, $probCount with problems$note"
     if ($script:ConnectFailed -and $ui.Status.Text -like 'Could not connect*') { $ui.Status.Text = ($ui.Status.Text -split '  \| ')[0] + "  | $counts" }
     else { $ui.Status.Text = $counts }
@@ -842,6 +877,7 @@ function Connect-FromBox {
         $ui.Status.Foreground = [System.Windows.Media.Brushes]::Firebrick
         $ui.Status.ToolTip = "$err`n`nWinRM must be enabled on the target (Enable-PSRemoting) or DCOM allowed through its firewall, and you need administrator rights there."
         $script:ConnectFailed = $true
+        Write-Log 'WARN' "Fell back to local after failing to connect to $name"
         Update-Title
         return $true
     }
@@ -876,7 +912,7 @@ function Set-SelectedState {
             if ($Enable) { Enable-ScheduledTask @script:CimArgs -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop | Out-Null }
             else { Disable-ScheduledTask @script:CimArgs -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop | Out-Null }
             $ok++
-        } catch { $fail += "$($r.Name): $($_.Exception.Message.Trim())" }
+        } catch { $fail += "$($r.Name): $($_.Exception.Message.Trim())"; Write-Log 'ERROR' "$verb $($r.Folder)$($r.Name)" $_ }
     }
     Load-Tasks
     $msg = "${verb}: $ok succeeded"
@@ -888,12 +924,21 @@ function Set-SelectedState {
 }
 
 $ui.Refresh.Add_Click({ Load-Tasks })
+$ui.OpenLog.Add_Click({
+    if (-not (Test-Path -LiteralPath $script:LogPath)) { Write-Log 'INFO' 'Log opened (empty)' }
+    Start-Process notepad.exe -ArgumentList "`"$($script:LogPath)`""
+})
 $ui.Connect.Add_Click({ Load-Tasks })
 $ui.Computer.Add_KeyDown({ param($sender, $e) if ($e.Key -eq 'Return') { Load-Tasks } })
 if (-not (Test-IsLocalName $ComputerName)) { $ui.Computer.Text = $ComputerName.Trim() }
 $ui.Filter.Add_TextChanged({ Apply-Filter })
 $ui.HideMs.Add_Click({ Apply-Filter })
 $ui.OnlyNet.Add_Click({ Apply-Filter })
+$cmTree = $ui.TreeMenu.ContextMenu
+foreach ($item in $cmTree.Items) { if ($item -is [System.Windows.Controls.MenuItem] -and $item.Name) { $ui[$item.Name] = $item } }
+$ui.TreeMenu.Add_Click({ $cmTree.PlacementTarget = $ui.TreeMenu; $cmTree.IsOpen = $true })
+$ui.ScopeAll.Add_Click({ $ui.ScopeAll.IsChecked = $true; $ui.ScopeFolder.IsChecked = $false; $script:TreeScope = 'all'; Apply-Filter })
+$ui.ScopeFolder.Add_Click({ $ui.ScopeFolder.IsChecked = $true; $ui.ScopeAll.IsChecked = $false; $script:TreeScope = 'folder'; Apply-Filter })
 $ui.Tree.Add_SelectedItemChanged({
     if ($script:SuppressTree) { return }
     $n = $ui.Tree.SelectedItem
@@ -905,7 +950,7 @@ $ui.Enable.Add_Click({ Set-SelectedState -Enable:$true })
 $ui.RunNow.Add_Click({
     foreach ($r in @($ui.Grid.SelectedItems)) {
         try { Start-ScheduledTask @script:CimArgs -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop }
-        catch { [System.Windows.MessageBox]::Show($_.Exception.Message, 'Run failed') | Out-Null }
+        catch { Write-Log 'ERROR' "Run $($r.Folder)$($r.Name)" $_; [System.Windows.MessageBox]::Show($_.Exception.Message, 'Run failed') | Out-Null }
     }
     Load-Tasks
 })
@@ -945,7 +990,7 @@ function Invoke-OnSelected {
     if ($rows.Count -eq 0) { $ui.Status.Text = 'Nothing selected'; return }
     $ok = 0; $fail = @()
     foreach ($r in $rows) {
-        try { & $Action $r; $ok++ } catch { $fail += "$($r.Name): $($_.Exception.Message.Trim())" }
+        try { & $Action $r; $ok++ } catch { $fail += "$($r.Name): $($_.Exception.Message.Trim())"; Write-Log 'ERROR' "$Verb $($r.Folder)$($r.Name)" $_ }
     }
     Load-Tasks
     $msg = "${Verb}: $ok succeeded"
@@ -1023,6 +1068,7 @@ function Get-TaskHistory {
         $events = Get-WinEvent @ev -LogName 'Microsoft-Windows-TaskScheduler/Operational' -FilterXPath $xpath -MaxEvents 200 -ErrorAction Stop
         return @($events | ForEach-Object { [pscustomobject]@{ Time = $_.TimeCreated; Id = $_.Id; Level = $_.LevelDisplayName; Message = ($_.Message -split "`r?`n")[0] } })
     } catch {
+        Write-Log 'WARN' "History for $TaskPath" $_
         return @([pscustomobject]@{ Time = $null; Id = ''; Level = ''; Message = "No history: $($_.Exception.Message)" })
     }
 }
@@ -1182,5 +1228,9 @@ $ui.Grid.Add_SelectionChanged({
     $ui.XmlBox.Text = $r.Xml
 })
 
-$window.Add_ContentRendered({ Update-Title; Load-Tasks })
-$window.ShowDialog() | Out-Null
+$window.Add_ContentRendered({
+    try { Update-Title; Load-Tasks } catch { Write-Log 'ERROR' 'Initial load failed' $_; [System.Windows.MessageBox]::Show("Initial load failed: $($_.Exception.Message)`nSee $($script:LogPath)", 'Task Inspector') | Out-Null }
+})
+try { $window.ShowDialog() | Out-Null }
+catch { Write-Log 'ERROR' 'Unhandled UI error' $_; throw }
+Write-Log 'INFO' 'Exit'

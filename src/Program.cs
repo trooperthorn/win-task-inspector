@@ -127,6 +127,15 @@ internal static class Program
 
     private static void Fail(string message, bool headless)
     {
+        try
+        {
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TaskInspector");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "TaskInspector.log"),
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " [FATAL] host: " + message.Replace("\r\n", " | ").Replace("\n", " | ") + Environment.NewLine);
+            message += Environment.NewLine + Environment.NewLine + "Logged to " + Path.Combine(dir, "TaskInspector.log");
+        }
+        catch { }
         if (headless)
         {
             try { Console.Error.WriteLine("Task Inspector: " + message); } catch { }
