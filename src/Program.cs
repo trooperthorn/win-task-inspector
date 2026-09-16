@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("Sean T. Martinez")]
 [assembly: AssemblyProduct("Task Inspector")]
 [assembly: AssemblyCopyright("MIT")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("2026.9.16.1")]
+[assembly: AssemblyFileVersion("2026.9.16.1")]
 
 internal static class Program
 {

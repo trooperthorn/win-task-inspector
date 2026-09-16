@@ -10,7 +10,7 @@ and publisher, and any URLs or hostnames found in the arguments or task XML.
 
 ## Run
 
-Build once, then run `dist\TaskInspector.exe`:
+Run `dist\TaskInspector.exe` from the repo or a Release. To rebuild after changes:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File Build.ps1
 
@@ -18,7 +18,8 @@ Build once, then run `dist\TaskInspector.exe`:
 Framework 4.x (no SDK or module to install), embeds `TaskInspector.ps1` as a resource,
 and stamps the icon, manifest, and version info. The exe hosts PowerShell in-process on
 an STA thread: no console window, no child powershell.exe, and "Relaunch as Admin"
-re-launches the exe itself. Rebuild after editing the script. `dist\` is not committed.
+re-launches the exe itself. Rebuild after editing the script. The built exe is committed
+in `dist\` and attached to every GitHub Release, so you can also just download it.
 
 The script still runs on its own for development, with the same arguments:
 

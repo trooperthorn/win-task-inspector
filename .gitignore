@@ -1,4 +1,4 @@
-dist/
+# dist/ is committed on purpose: the built exe ships in the repo
 *.swp
 *~
 Thumbs.db

@@ -113,9 +113,10 @@ window populated from the raw CIM task object.
 then invokes `csc.exe` with `/target:winexe`, the icon, the manifest
 (`asInvoker`, per-monitor DPI aware), the embedded script resource, and references to
 `System.Management.Automation` and `System.Windows.Forms`. The compiler is C# 5, so the
-host avoids newer language features. Output goes to `dist\`, which is not committed;
-the GitHub Actions workflow builds it on every push and publishes the exe as an
-artifact.
+host avoids newer language features. Output goes to `dist\`, which is committed so the
+repo always carries a runnable exe; the GitHub Actions workflow rebuilds it on every
+push, uploads it as an artifact, and attaches it to the Release on a version tag.
+Versions are CalVer, `vYYYY.MM.DD.N`, and the assembly version matches (`2026.9.16.1`).
 
 ### Logging
 
