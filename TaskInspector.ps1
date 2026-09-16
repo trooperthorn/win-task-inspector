@@ -264,7 +264,10 @@ function Get-TaskInventory {
             if ($info.NextRunTime -and $info.NextRunTime.Year -gt 2000) { $nextRun = $info.NextRunTime }
         }
 
+        $kinds = @(foreach ($t in @($task.Triggers)) { if ($t) { $t.CimClass.CimClassName -replace '^MSFT_Task', '' -replace 'Trigger$', '' } })
         $rows.Add([pscustomobject]@{
+            TaskObject  = $task
+            TriggerKinds = $kinds
             Folder      = $task.TaskPath
             Name        = $task.TaskName
             State       = $task.State.ToString()
@@ -297,9 +300,7 @@ function Get-TaskInventory {
       <TextBlock Text="Filter:" VerticalAlignment="Center" Margin="4,0"/>
       <TextBox x:Name="Filter" Width="260" Margin="0,0,8,0"/>
       <CheckBox x:Name="HideMs" Content="Hide \Microsoft\ tasks" VerticalAlignment="Center" Margin="0,0,8,0"/>
-      <CheckBox x:Name="HideDisabled" Content="Hide disabled" VerticalAlignment="Center" Margin="0,0,8,0"/>
       <CheckBox x:Name="OnlyNet" Content="Only with URLs/hosts" VerticalAlignment="Center" Margin="0,0,8,0"/>
-      <CheckBox x:Name="OnlyProblems" Content="Only problems" VerticalAlignment="Center" Margin="0,0,8,0" Foreground="#C62828"/>
       <Separator/>
       <Button x:Name="Refresh" Content="Refresh" Margin="4,0"/>
       <Button x:Name="Disable" Content="Disable selected" Margin="4,0"/>
@@ -310,6 +311,22 @@ function Get-TaskInventory {
       <Button x:Name="Elevate" Content="Relaunch as Admin" Margin="4,0"/>
       <TextBlock x:Name="Status" VerticalAlignment="Center" Margin="12,0" Foreground="Gray"/>
     </ToolBar>
+    <ListBox x:Name="Nav" DockPanel.Dock="Left" Width="190" Margin="0,0,4,0" FontSize="13" SelectedIndex="0">
+      <ListBoxItem Content="All tasks" Tag="all"/>
+      <ListBoxItem Content="Enabled" Tag="enabled"/>
+      <ListBoxItem Content="Disabled" Tag="disabled"/>
+      <ListBoxItem Content="Running now" Tag="running"/>
+      <Separator/>
+      <ListBoxItem Content="Run at logon" Tag="Logon"/>
+      <ListBoxItem Content="Run at startup" Tag="Boot"/>
+      <ListBoxItem Content="Run when idle" Tag="Idle"/>
+      <ListBoxItem Content="Run on a schedule" Tag="schedule"/>
+      <ListBoxItem Content="Run on an event" Tag="Event"/>
+      <ListBoxItem Content="No trigger (on demand)" Tag="none"/>
+      <Separator/>
+      <ListBoxItem Content="Problems" Tag="problems" Foreground="#C62828"/>
+      <ListBoxItem Content="Non-Microsoft" Tag="nonms"/>
+    </ListBox>
     <Grid>
       <Grid.RowDefinitions>
         <RowDefinition Height="3*"/>
@@ -330,6 +347,8 @@ function Get-TaskInventory {
             <MenuItem x:Name="CmCopyCmd" Header="Copy command line"/>
             <Separator/>
             <MenuItem x:Name="CmDelete" Header="Delete task..." Foreground="DarkRed"/>
+            <Separator/>
+            <MenuItem x:Name="CmProps" Header="Properties" FontWeight="Bold"/>
           </ContextMenu>
         </DataGrid.ContextMenu>
         <DataGrid.RowStyle>
@@ -378,9 +397,9 @@ function Get-TaskInventory {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $ui = @{}
-foreach ($n in 'Filter','HideMs','HideDisabled','OnlyNet','OnlyProblems','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
+foreach ($n in 'Filter','HideMs','OnlyNet','Nav','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
 $cm = $ui.Grid.ContextMenu
-foreach ($item in $cm.Items) { if ($item.Name) { $ui[$item.Name] = $item } }
+foreach ($item in $cm.Items) { if ($item -is [System.Windows.Controls.MenuItem] -and $item.Name) { $ui[$item.Name] = $item } }
 $ui.HideMs.IsChecked = $true
 if ($script:IsAdmin) { $window.Title = 'Task Inspector (Administrator)'; $ui.Elevate.IsEnabled = $false }
 
@@ -389,19 +408,48 @@ $script:All = @()
 function Apply-Filter {
     $f = $ui.Filter.Text
     $hideMs = $ui.HideMs.IsChecked
-    $hideDis = $ui.HideDisabled.IsChecked
     $onlyNet = $ui.OnlyNet.IsChecked
-    $onlyProb = $ui.OnlyProblems.IsChecked
+    $nav = 'all'
+    if ($ui.Nav.SelectedItem -and $ui.Nav.SelectedItem.Tag) { $nav = [string]$ui.Nav.SelectedItem.Tag }
     $filtered = $script:All | Where-Object {
-        ($(if ($hideMs) { $_.Folder -notlike '\Microsoft\*' } else { $true })) -and
-        ($(if ($hideDis) { $_.State -ne 'Disabled' } else { $true })) -and
+        ($(if ($hideMs -and $nav -ne 'nonms') { $_.Folder -notlike '\Microsoft\*' } else { $true })) -and
         ($(if ($onlyNet) { [bool]$_.Accesses } else { $true })) -and
-        ($(if ($onlyProb) { $_.HasProblem } else { $true })) -and
+        ($(switch ($nav) {
+            'all'      { $true }
+            'enabled'  { $_.State -ne 'Disabled' }
+            'disabled' { $_.State -eq 'Disabled' }
+            'running'  { $_.State -eq 'Running' }
+            'schedule' { @($_.TriggerKinds | Where-Object { $_ -in 'Daily','Weekly','Monthly','MonthlyDOW','Time' }).Count -gt 0 }
+            'none'     { @($_.TriggerKinds).Count -eq 0 }
+            'problems' { $_.HasProblem }
+            'nonms'    { $_.Folder -notlike '\Microsoft\*' }
+            default    { $nav -in @($_.TriggerKinds) }
+        })) -and
         ($(if ($f) { ($_.Folder + $_.Name + $_.Action + $_.Arguments + $_.Publisher + $_.Accesses + $_.Triggers + $_.Author) -like "*$f*" } else { $true }))
     }
+    # Remember sort and selection so an action does not reshuffle the grid
+    $sorts = @()
+    if ($ui.Grid.ItemsSource) {
+        $oldView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.Grid.ItemsSource)
+        if ($oldView) { $sorts = @($oldView.SortDescriptions | ForEach-Object { New-Object System.ComponentModel.SortDescription($_.PropertyName, $_.Direction) }) }
+    }
+    $selectedKeys = @($ui.Grid.SelectedItems | ForEach-Object { $_.Folder + $_.Name })
+
     $view = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
     foreach ($r in @($filtered)) { $view.Add($r) }
     $ui.Grid.ItemsSource = $view
+
+    $newView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($view)
+    $newView.SortDescriptions.Clear()
+    foreach ($sd in $sorts) {
+        $newView.SortDescriptions.Add($sd)
+        foreach ($col in $ui.Grid.Columns) { if ($col.SortMemberPath -eq $sd.PropertyName) { $col.SortDirection = $sd.Direction } }
+    }
+    if ($selectedKeys.Count) {
+        $ui.Grid.SelectedItems.Clear()
+        foreach ($r in $view) { if (($r.Folder + $r.Name) -in $selectedKeys) { $ui.Grid.SelectedItems.Add($r) } }
+        if ($ui.Grid.SelectedItem) { $ui.Grid.ScrollIntoView($ui.Grid.SelectedItem) }
+    }
     $note = ''
     if (-not $script:IsAdmin) { $note = '  (not elevated: SYSTEM tasks are read-only)' }
     $probCount = @($script:All | Where-Object HasProblem).Count
@@ -442,9 +490,8 @@ function Set-SelectedState {
 $ui.Refresh.Add_Click({ Load-Tasks })
 $ui.Filter.Add_TextChanged({ Apply-Filter })
 $ui.HideMs.Add_Click({ Apply-Filter })
-$ui.HideDisabled.Add_Click({ Apply-Filter })
 $ui.OnlyNet.Add_Click({ Apply-Filter })
-$ui.OnlyProblems.Add_Click({ Apply-Filter })
+$ui.Nav.Add_SelectionChanged({ if ($ui.Nav.SelectedItem -is [System.Windows.Controls.ListBoxItem]) { Apply-Filter } })
 $ui.Disable.Add_Click({ Set-SelectedState -Enable:$false })
 $ui.Enable.Add_Click({ Set-SelectedState -Enable:$true })
 $ui.RunNow.Add_Click({
@@ -518,6 +565,166 @@ function Open-SelectedLocation {
     }
 }
 
+
+function Get-PropertyLines {
+    param($Obj, [string[]]$Skip = @('CimClass','CimInstanceProperties','CimSystemProperties','PSComputerName'))
+    if ($null -eq $Obj) { return @() }
+    $out = @()
+    foreach ($p in $Obj.PSObject.Properties) {
+        if ($p.Name -in $Skip) { continue }
+        $v = $p.Value
+        if ($null -eq $v -or $v -eq '') { continue }
+        if ($v -is [ciminstance]) {
+            $inner = (Get-PropertyLines $v) -join ', '
+            if ($inner) { $out += ('{0}={1}' -f $p.Name, $inner) }
+        } elseif ($v -is [array]) {
+            $out += ('{0}={1}' -f $p.Name, ($v -join ', '))
+        } else {
+            $out += ('{0}={1}' -f $p.Name, $v)
+        }
+    }
+    return $out
+}
+
+function Get-TaskHistory {
+    param([string]$TaskPath)
+    try {
+        $log = Get-WinEvent -ListLog 'Microsoft-Windows-TaskScheduler/Operational' -ErrorAction Stop
+        if (-not $log.IsEnabled) {
+            return @([pscustomobject]@{ Time = $null; Id = ''; Level = ''; Message = 'Task history is disabled. Enable it in Task Scheduler (Actions > Enable All Tasks History).' })
+        }
+        $xpath = "*[EventData[Data[@Name='TaskName']='$TaskPath']]"
+        $events = Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -FilterXPath $xpath -MaxEvents 200 -ErrorAction Stop
+        return @($events | ForEach-Object { [pscustomobject]@{ Time = $_.TimeCreated; Id = $_.Id; Level = $_.LevelDisplayName; Message = ($_.Message -split "`r?`n")[0] } })
+    } catch {
+        return @([pscustomobject]@{ Time = $null; Id = ''; Level = ''; Message = "No history: $($_.Exception.Message)" })
+    }
+}
+
+function Show-TaskProperties {
+    param($Row)
+    if ($null -eq $Row) { return }
+    $task = $Row.TaskObject
+    [xml]$px = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Properties" Height="640" Width="880" WindowStartupLocation="CenterOwner">
+  <DockPanel>
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="8">
+      <Button x:Name="PClose" Content="Close" Width="80" IsCancel="True"/>
+    </StackPanel>
+    <TabControl Margin="8">
+      <TabItem Header="General"><TextBox x:Name="PGeneral" IsReadOnly="True" FontFamily="Consolas" FontSize="12" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"/></TabItem>
+      <TabItem Header="Triggers"><DataGrid x:Name="PTriggers" AutoGenerateColumns="False" IsReadOnly="True" HeadersVisibility="Column">
+        <DataGrid.Columns>
+          <DataGridTextColumn Header="Trigger" Binding="{Binding Type}" Width="130"/>
+          <DataGridTextColumn Header="Details" Binding="{Binding Details}" Width="*"/>
+          <DataGridTextColumn Header="Enabled" Binding="{Binding Enabled}" Width="70"/>
+        </DataGrid.Columns></DataGrid></TabItem>
+      <TabItem Header="Actions"><DataGrid x:Name="PActions" AutoGenerateColumns="False" IsReadOnly="True" HeadersVisibility="Column">
+        <DataGrid.Columns>
+          <DataGridTextColumn Header="Action" Binding="{Binding Type}" Width="130"/>
+          <DataGridTextColumn Header="Details" Binding="{Binding Details}" Width="*"/>
+        </DataGrid.Columns></DataGrid></TabItem>
+      <TabItem Header="Conditions"><TextBox x:Name="PConditions" IsReadOnly="True" FontFamily="Consolas" FontSize="12" VerticalScrollBarVisibility="Auto"/></TabItem>
+      <TabItem Header="Settings"><TextBox x:Name="PSettings" IsReadOnly="True" FontFamily="Consolas" FontSize="12" VerticalScrollBarVisibility="Auto"/></TabItem>
+      <TabItem Header="History"><DataGrid x:Name="PHistory" AutoGenerateColumns="False" IsReadOnly="True" HeadersVisibility="Column">
+        <DataGrid.Columns>
+          <DataGridTextColumn Header="Time" Binding="{Binding Time, StringFormat=yyyy-MM-dd HH:mm:ss}" Width="150"/>
+          <DataGridTextColumn Header="Event" Binding="{Binding Id}" Width="60"/>
+          <DataGridTextColumn Header="Level" Binding="{Binding Level}" Width="90"/>
+          <DataGridTextColumn Header="Message" Binding="{Binding Message}" Width="*"/>
+        </DataGrid.Columns></DataGrid></TabItem>
+      <TabItem Header="XML"><TextBox x:Name="PXml" IsReadOnly="True" FontFamily="Consolas" FontSize="11" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/></TabItem>
+    </TabControl>
+  </DockPanel>
+</Window>
+"@
+    $pw = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $px))
+    $pw.Owner = $window
+    $pw.Title = "$($Row.Name) Properties"
+    $g = @{}; foreach ($n in 'PClose','PGeneral','PTriggers','PActions','PConditions','PSettings','PHistory','PXml') { $g[$n] = $pw.FindName($n) }
+
+    $pr = $task.Principal
+    $st = $task.Settings
+    $g.PGeneral.Text = @(
+        "Name:          $($task.TaskName)"
+        "Location:      $($task.TaskPath)"
+        "Author:        $($task.Author)"
+        "Description:   $($task.Description)"
+        ""
+        "State:         $($task.State)"
+        "Last run:      $($Row.LastRun)  ($($Row.LastResult))"
+        "Next run:      $($Row.NextRun)"
+        ""
+        "Security options"
+        "  Run as:      $($pr.UserId)  (group: $($pr.GroupId))"
+        "  Logon type:  $($pr.LogonType)"
+        "  Run level:   $($pr.RunLevel)"
+        "  Hidden:      $($st.Hidden)"
+        "  Version:     $($task.Version)   Source: $($task.Source)   URI: $($task.URI)"
+        ""
+        "Problem:       $($Row.Problem)"
+    ) -join "`n"
+
+    $g.PTriggers.ItemsSource = @(foreach ($t in @($task.Triggers)) { if ($t) {
+        [pscustomobject]@{
+            Type    = ($t.CimClass.CimClassName -replace '^MSFT_Task', '' -replace 'Trigger$', '')
+            Details = ((Get-PropertyLines $t -Skip @('CimClass','CimInstanceProperties','CimSystemProperties','PSComputerName','Enabled','Id')) -join ' | ')
+            Enabled = $t.Enabled
+        } } })
+    $g.PActions.ItemsSource = @(foreach ($a in @($task.Actions)) { if ($a) {
+        [pscustomobject]@{
+            Type    = ($a.CimClass.CimClassName -replace '^MSFT_Task', '' -replace 'Action$', '')
+            Details = ((Get-PropertyLines $a -Skip @('CimClass','CimInstanceProperties','CimSystemProperties','PSComputerName','Id')) -join ' | ')
+        } } })
+
+    $g.PConditions.Text = @(
+        "Idle"
+        "  Run only if idle:              $($st.RunOnlyIfIdle)"
+        "  Idle duration / wait timeout:  $(Convert-IsoDuration $st.IdleSettings.IdleDuration) / $(Convert-IsoDuration $st.IdleSettings.WaitTimeout)"
+        "  Stop if idle ends:             $($st.IdleSettings.StopOnIdleEnd)"
+        "  Restart on idle:               $($st.IdleSettings.RestartOnIdle)"
+        ""
+        "Power"
+        "  Start only on AC power:        $($st.DisallowStartIfOnBatteries)"
+        "  Stop if switching to battery:  $($st.StopIfGoingOnBatteries)"
+        "  Wake the computer to run:      $($st.WakeToRun)"
+        ""
+        "Network"
+        "  Only if network available:     $($st.RunOnlyIfNetworkAvailable)"
+        "  Network id / name:             $($st.NetworkSettings.Id) $($st.NetworkSettings.Name)"
+    ) -join "`n"
+
+    $maint = 'none'
+    if ($st.MaintenanceSettings) { $maint = 'period ' + (Convert-IsoDuration $st.MaintenanceSettings.Period) + ', deadline ' + (Convert-IsoDuration $st.MaintenanceSettings.Deadline) + ', exclusive ' + $st.MaintenanceSettings.Exclusive }
+    $g.PSettings.Text = @(
+        "Allow task to be run on demand:             $($st.AllowDemandStart)"
+        "Run as soon as possible after missed start: $($st.StartWhenAvailable)"
+        "If the task fails, restart every:           $(Convert-IsoDuration $st.RestartInterval)  (up to $($st.RestartCount) times)"
+        "Stop the task if it runs longer than:       $(Convert-IsoDuration $st.ExecutionTimeLimit)"
+        "Force stop if it does not end:              $($st.AllowHardTerminate)"
+        "Delete if not scheduled to run again after: $(Convert-IsoDuration $st.DeleteExpiredTaskAfter)"
+        "If already running:                         $($st.MultipleInstances)"
+        "Priority:                                   $($st.Priority)"
+        "Compatibility:                              $($st.Compatibility)"
+        "Enabled:                                    $($st.Enabled)"
+        "Run only when user is logged on:            $($pr.LogonType -eq 'Interactive')"
+        "Do not store password:                      $($pr.LogonType -eq 'S4U')"
+        "Disallow start on remote app session:       $($st.DisallowStartOnRemoteAppSession)"
+        "Use unified scheduling engine:              $($st.UseUnifiedSchedulingEngine)"
+        "Volatile:                                   $($st.Volatile)"
+        "Maintenance:                                $maint"
+    ) -join "`n"
+
+    $g.PHistory.ItemsSource = Get-TaskHistory ($task.TaskPath + $task.TaskName)
+    $g.PXml.Text = $Row.Xml
+    $g.PClose.Add_Click({ $pw.Close() })
+    $pw.ShowDialog() | Out-Null
+}
+
+$ui.CmProps.Add_Click({ Show-TaskProperties $ui.Grid.SelectedItem })
+$ui.Grid.Add_MouseDoubleClick({ Show-TaskProperties $ui.Grid.SelectedItem })
 $ui.CmEnable.Add_Click({ Set-SelectedState -Enable:$true })
 $ui.CmDisable.Add_Click({ Set-SelectedState -Enable:$false })
 $ui.CmRun.Add_Click({ Invoke-OnSelected -Verb 'Run' -Action { param($r) Start-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop } })
