@@ -199,6 +199,111 @@ function Test-SidResolves {
     return $ok
 }
 
+
+# Task Scheduler and common process/Windows codes that the system message table
+# either lacks or describes poorly. Everything else falls back to FormatMessage.
+$script:KnownResults = @{
+    0x00000000 = 'The operation completed successfully.'
+    0x00000001 = 'Incorrect function (or the program exited with code 1, a generic failure).'
+    0x00000002 = 'The system cannot find the file specified (or the program exited with code 2).'
+    0x00000003 = 'The system cannot find the path specified (or exit code 3).'
+    0x00000005 = 'Access is denied (or exit code 5).'
+    0x0000000A = 'The environment is incorrect (or exit code 10).'
+    0x00000020 = 'The process cannot access the file because it is being used by another process (or exit code 32).'
+    0x00000057 = 'The parameter is incorrect (or exit code 87).'
+    0x000000FF = 'Exit code 255: the program reported a general failure.'
+    0x00000420 = 'An instance of the service is already running.'
+    0x000004C7 = 'The operation was cancelled by the user.'
+    0x00041300 = 'SCHED_S_TASK_READY: the task is ready to run at its next scheduled time.'
+    0x00041301 = 'SCHED_S_TASK_RUNNING: the task is currently running.'
+    0x00041302 = 'SCHED_S_TASK_DISABLED: the task will not run at the scheduled times because it has been disabled.'
+    0x00041303 = 'SCHED_S_TASK_HAS_NOT_RUN: the task has not yet run.'
+    0x00041304 = 'SCHED_S_TASK_NO_MORE_RUNS: there are no more runs scheduled for this task.'
+    0x00041305 = 'SCHED_S_TASK_NOT_SCHEDULED: one or more of the properties needed to run this task have not been set.'
+    0x00041306 = 'SCHED_S_TASK_TERMINATED: the last run of the task was terminated by the user.'
+    0x00041307 = 'SCHED_S_TASK_NO_VALID_TRIGGERS: the task has no valid triggers, or the existing triggers are disabled or not set.'
+    0x00041308 = 'SCHED_S_EVENT_TRIGGER: event triggers do not have set run times.'
+    0x0004131B = 'SCHED_S_SOME_TRIGGERS_FAILED: the task is registered, but not all specified triggers will start it.'
+    0x0004131C = 'SCHED_S_BATCH_LOGON_PROBLEM: the task is registered, but may fail because the batch logon privilege must be enabled for the account.'
+    0x0004131D = 'SCHED_S_TASK_QUEUED: the task is queued.'
+    0x8004130F = 'SCHED_E_ACCOUNT_INFORMATION_NOT_SET: no account information could be found for this task.'
+    0x80041310 = 'SCHED_E_ACCOUNT_NAME_NOT_FOUND: the specified account name is not valid.'
+    0x80041311 = 'SCHED_E_ACCOUNT_DBASE_CORRUPT: the Task Scheduler account database is corrupt.'
+    0x80041312 = 'SCHED_E_NO_SECURITY_SERVICES: no security services are available.'
+    0x80041313 = 'SCHED_E_UNKNOWN_OBJECT_VERSION: the task object version is unsupported or invalid.'
+    0x80041314 = 'SCHED_E_UNSUPPORTED_ACCOUNT_OPTION: the task has an unsupported combination of account settings and run time options.'
+    0x80041315 = 'SCHED_E_SERVICE_NOT_RUNNING: the Task Scheduler service is not running.'
+    0x80041316 = 'SCHED_E_UNEXPECTEDNODE: the task XML contains an unexpected node.'
+    0x80041317 = 'SCHED_E_NAMESPACE: the task XML contains an element or attribute from an unexpected namespace.'
+    0x80041318 = 'SCHED_E_INVALIDVALUE: the task XML contains a value which is incorrectly formatted or out of range.'
+    0x80041319 = 'SCHED_E_MISSINGNODE: the task XML is missing a required element or attribute.'
+    0x8004131A = 'SCHED_E_MALFORMEDXML: the task XML is malformed.'
+    0x8004131E = 'SCHED_E_TOO_MANY_NODES: the task XML contains too many nodes of the same type.'
+    0x8004131F = 'SCHED_E_ALREADY_RUNNING: an instance of this task is already running.'
+    0x80041320 = 'SCHED_E_USER_NOT_LOGGED_ON: the task will not run because the user is not logged on.'
+    0x80041321 = 'SCHED_E_INVALID_TASK_HASH: the task image is corrupt or has been tampered with.'
+    0x80041322 = 'SCHED_E_SERVICE_NOT_AVAILABLE: the Task Scheduler service is not available.'
+    0x80041323 = 'SCHED_E_SERVICE_TOO_BUSY: the Task Scheduler service is too busy to handle your request.'
+    0x80041324 = 'SCHED_E_TASK_ATTEMPTED: the service attempted to run the task, but it did not run due to one of the constraints in the task definition.'
+    0x80041325 = 'SCHED_E_TASK_QUEUED: the service has asked the task to run.'
+    0x80041326 = 'SCHED_E_TASK_DISABLED: the task is disabled.'
+    0x80041327 = 'SCHED_E_TASK_NOT_V1_COMPAT: the task has properties that are not compatible with previous versions of Windows.'
+    0x80041328 = 'SCHED_E_START_ON_DEMAND: the task settings do not allow the task to start on demand.'
+    0x80041329 = 'SCHED_E_TASK_NOT_UBPM_COMPAT: the combination of properties is not compatible with the scheduling engine.'
+    0x80041330 = 'SCHED_E_DEPRECATED_FEATURE_USED: the task uses a deprecated feature.'
+    0x80070002 = 'ERROR_FILE_NOT_FOUND: the system cannot find the file specified. The action''s program is missing or the path is wrong.'
+    0x80070003 = 'ERROR_PATH_NOT_FOUND: the system cannot find the path specified.'
+    0x80070005 = 'ERROR_ACCESS_DENIED: access is denied. The run-as account lacks rights to the program, file, or object.'
+    0x8007010B = 'ERROR_DIRECTORY: the directory name is invalid. Check the action''s Start-in folder.'
+    0x80070420 = 'ERROR_SERVICE_ALREADY_RUNNING: an instance of the service is already running.'
+    0x800704C7 = 'ERROR_CANCELLED: the operation was cancelled by the user.'
+    0x800706BA = 'RPC_S_SERVER_UNAVAILABLE: the RPC server is unavailable.'
+    0x800710E0 = 'The operator or administrator has refused the request. Usually the task is set to run only when the user is logged on, or a condition such as AC power or idle was not met.'
+    0x80070520 = 'ERROR_NO_SUCH_LOGON_SESSION: a specified logon session does not exist; the account may need to be re-entered.'
+    0x8007052E = 'ERROR_LOGON_FAILURE: the user name or password is incorrect; the stored credentials for the task are stale.'
+    0x80070569 = 'ERROR_LOGON_TYPE_NOT_GRANTED: the account has not been granted the requested logon type (log on as a batch job).'
+    0xC0000005 = 'STATUS_ACCESS_VIOLATION: the program crashed with an access violation.'
+    0xC000013A = 'STATUS_CONTROL_C_EXIT: the program was terminated by Ctrl+C or a close request.'
+    0xC0000142 = 'STATUS_DLL_INIT_FAILED: a DLL initialization routine failed, usually a session 0 or missing dependency problem.'
+    0xC0000409 = 'STATUS_STACK_BUFFER_OVERRUN: the program aborted (fast fail or a security check failure).'
+    0xE0434352 = 'CLR unhandled exception: a .NET program crashed with an unhandled exception.'
+    0x00000102 = 'WAIT_TIMEOUT (or exit code 258): the operation timed out.'
+    0x000004F7 = 'ERROR_TIMEOUT / exit 1271: the operation timed out.'
+    0x0000041D = 'Exit code 1053: the service did not respond to the start or control request in a timely fashion.'
+}
+
+# Normalise the table keys once: literals like 0x80070005 parse as negative Int32,
+# 0xC0000005 as Int64, so key everything by its 8-digit hex string.
+$script:KnownResultsHex = @{}
+foreach ($k in $script:KnownResults.Keys) {
+    $script:KnownResultsHex[('{0:X8}' -f ([int64]$k -band 0xFFFFFFFFL))] = $script:KnownResults[$k]
+}
+
+function Get-ResultDetail {
+    param([int64]$Code)
+    $u = [int64]($Code -band 0xFFFFFFFFL)
+    $hex = '{0:X8}' -f $u
+    if ($script:KnownResultsHex.ContainsKey($hex)) { return $script:KnownResultsHex[$hex] }
+    $signed = [int]$(if ($u -gt 0x7FFFFFFF) { $u - 0x100000000 } else { $u })
+    $text = ''
+    try {
+        if (($u -band 0xFFFF0000L) -eq 0x80070000L) {
+            $text = (New-Object System.ComponentModel.Win32Exception([int]($u -band 0xFFFF))).Message
+            if ($text) { $text = "Win32 error $($u -band 0xFFFF): $text" }
+        } elseif ($u -lt 0x10000) {
+            $text = (New-Object System.ComponentModel.Win32Exception([int]$u)).Message
+            if ($text -and $text -notlike 'Unknown error*') { $text = "Exit/Win32 code ${u}: $text" } else { $text = "Process exit code $u (meaning is specific to that program)." }
+        } elseif ($u -ge 0xFFFF0000L) {
+            $text = "Process exit code $signed (negative return value from the program)."
+        } else {
+            $ex = [System.Runtime.InteropServices.Marshal]::GetExceptionForHR($signed)
+            if ($ex -and $ex.Message -notlike 'Exception from HRESULT*') { $text = $ex.Message }
+        }
+    } catch {}
+    if (-not $text) { $text = 'Unknown result code.' }
+    return $text
+}
+
 function Get-TaskInventory {
     $rows = New-Object System.Collections.Generic.List[object]
     $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue
@@ -252,11 +357,14 @@ function Get-TaskInventory {
         foreach ($m in $script:HostRegex.Matches($argText)) { $targets += $m.Value }
         $targets = @($targets | Sort-Object -Unique)
 
-        $lastResult = ''
+        $lastResult = ''; $resultDetail = ''
         if ($info) {
-            if ($info.LastTaskResult -eq 0) { $lastResult = 'OK' }
-            elseif ($info.LastTaskResult -eq 267011) { $lastResult = 'Never ran' }
-            else { $lastResult = ('0x{0:X8}' -f $info.LastTaskResult) }
+            $code = [int64]$info.LastTaskResult -band 0xFFFFFFFFL
+            $hex = ('0x{0:X8}' -f $code)
+            $resultDetail = "$hex`n" + (Get-ResultDetail $code)
+            if ($code -eq 0) { $lastResult = 'OK' }
+            elseif ($code -eq 267011) { $lastResult = 'Never ran' }
+            else { $lastResult = $hex }
         }
         $lastRun = $null; $nextRun = $null
         if ($info) {
@@ -275,6 +383,7 @@ function Get-TaskInventory {
             RunAs       = $task.Principal.UserId
             LastRun     = $lastRun
             LastResult  = $lastResult
+            ResultDetail = $resultDetail
             NextRun     = $nextRun
             Triggers    = Get-TriggerSummary $task
             Action      = ($execs -join ' | ')
@@ -388,7 +497,15 @@ function Get-TaskInventory {
           <DataGridTextColumn Header="State" Binding="{Binding State}" Width="70"/>
           <DataGridTextColumn Header="Problem" Binding="{Binding Problem}" Width="220"/>
           <DataGridTextColumn Header="Last run" Binding="{Binding LastRun, StringFormat=yyyy-MM-dd HH:mm}" Width="120"/>
-          <DataGridTextColumn Header="Result" Binding="{Binding LastResult}" Width="80"/>
+          <DataGridTextColumn Header="Result" Binding="{Binding LastResult}" Width="80">
+            <DataGridTextColumn.ElementStyle>
+              <Style TargetType="TextBlock">
+                <Setter Property="ToolTip" Value="{Binding ResultDetail}"/>
+                <Setter Property="ToolTipService.ShowDuration" Value="30000"/>
+                <Setter Property="ToolTipService.InitialShowDelay" Value="200"/>
+              </Style>
+            </DataGridTextColumn.ElementStyle>
+          </DataGridTextColumn>
           <DataGridTextColumn Header="Next run" Binding="{Binding NextRun, StringFormat=yyyy-MM-dd HH:mm}" Width="120"/>
           <DataGridTextColumn Header="Triggers" Binding="{Binding Triggers}" Width="260"/>
           <DataGridTextColumn Header="Action" Binding="{Binding Action}" Width="300"/>
@@ -581,7 +698,7 @@ $ui.ExportCsv.Add_Click({
     $dlg.Filter = 'CSV|*.csv'
     $dlg.FileName = "scheduled-tasks-$(Get-Date -Format yyyyMMdd-HHmm).csv"
     if ($dlg.ShowDialog()) {
-        $script:All | Select-Object Folder,Name,State,Problem,LastRun,LastResult,NextRun,Triggers,Action,Arguments,Publisher,Accesses,RunAs,Author,Description |
+        $script:All | Select-Object Folder,Name,State,Problem,LastRun,LastResult,ResultDetail,NextRun,Triggers,Action,Arguments,Publisher,Accesses,RunAs,Author,Description |
             Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
         $ui.Status.Text = "Exported to $($dlg.FileName)"
     }
@@ -730,6 +847,7 @@ function Show-TaskProperties {
         ""
         "State:         $($task.State)"
         "Last run:      $($Row.LastRun)  ($($Row.LastResult))"
+        "Result:        $($Row.ResultDetail -replace "`n", ' - ')"
         "Next run:      $($Row.NextRun)"
         ""
         "Security options"
@@ -817,6 +935,7 @@ $ui.Grid.Add_SelectionChanged({
         "State:       $($r.State)    Run as: $($r.RunAs)    Author: $($r.Author)"
         "Problem:     $($r.Problem)"
         "Last run:    $($r.LastRun)  ($($r.LastResult))"
+        "Result:      $($r.ResultDetail -replace "`n", ' - ')"
         "Next run:    $($r.NextRun)"
         "Triggers:    $($r.Triggers)"
         "Action:      $($r.Action)"

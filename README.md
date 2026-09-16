@@ -41,6 +41,10 @@ Requires Windows PowerShell 5.1 or later. No modules, no install.
   exists, or the task name, folder, or run-as principal carries a SID that no longer
   resolves to an account (a leftover from a deleted user). The Problem column says
   which. The **Problems** view on the left filters to those rows.
+- **Result column** shows the last run's return code; hover it for the meaning. Task
+  Scheduler codes (0x41301, 0x80041324, ...) and common Windows codes (0x80070005,
+  0x800710E0, ...) come from a built-in table; anything else is looked up through the
+  Windows message table, and small values are also explained as process exit codes.
 - **Export CSV** writes the full inventory.
 - The bottom pane shows details and the raw task XML for the selected row.
 
