@@ -15,11 +15,156 @@
   Requires Windows PowerShell 5.1+ (STA). Read-only until you press Enable/Disable.
 #>
 [CmdletBinding()]
-param()
+param(
+    # Hostname, FQDN, or IP address. Empty, ".", or "localhost" means this computer.
+    [Parameter(Position = 0)] [string]$ComputerName = '',
+    # When given, no window: the inventory is written to this CSV and the program exits.
+    [Parameter(Position = 1)] [string]$Csv = '',
+    # Optional user name for the remote connection; the password is prompted for.
+    [string]$Credential = '',
+    [switch]$Help
+)
+
+if ($Help) {
+    $usage = @'
+Task Inspector
+  TaskInspector.exe                           open the window, this computer
+  TaskInspector.exe <host>                    open the window connected to <host>
+  TaskInspector.exe <host> <out.csv>          headless: write the inventory to CSV and exit
+  TaskInspector.exe -ComputerName <host> -Csv <out.csv> [-Credential DOMAIN\user]
+  TaskInspector.exe . <out.csv>               headless export of this computer
+
+<host> is a hostname, FQDN, or IP address. Remote access uses WinRM (CIM) with a
+DCOM fallback and needs administrator rights on the target.
+'@
+    try { [Console]::Out.WriteLine($usage) } catch {}
+    if (-not $Csv) { try { Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show($usage, 'Task Inspector') | Out-Null } catch {} }
+    return
+}
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
 
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# ---- Target: local by default, or a remote computer through a CIM session ----
+$script:Target = ''            # display name; '' = local
+$script:Cim = $null            # CimSession when remote
+$script:CimArgs = @{}          # splat for every *-ScheduledTask call
+$script:RemoteEnv = $null      # remote %windir% etc.
+$script:RemoteCred = $null
+
+function Test-IsLocalName {
+    param([string]$Name)
+    if (-not $Name) { return $true }
+    $n = $Name.Trim().ToLowerInvariant()
+    if ($n -in '.', 'localhost', '127.0.0.1', '::1', $env:COMPUTERNAME.ToLowerInvariant()) { return $true }
+    if ($n -eq ([System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName.ToLowerInvariant())) { return $true }
+    return $false
+}
+
+function Connect-Target {
+    # Returns '' on success or an error message. Resets all caches.
+    param([string]$Name, [pscredential]$Cred)
+    if ($script:Cim) { try { Remove-CimSession $script:Cim -ErrorAction SilentlyContinue } catch {}; $script:Cim = $null }
+    $script:CimArgs = @{}; $script:Target = ''; $script:RemoteEnv = $null; $script:RemoteCred = $Cred
+    $script:ExeCache = @{}; $script:ComCache = @{}; $script:SidCache = @{}
+    if (Test-IsLocalName $Name) { return '' }
+    $opts = @{ ComputerName = $Name.Trim(); ErrorAction = 'Stop'; OperationTimeoutSec = 30 }
+    if ($Cred) { $opts.Credential = $Cred }
+    $errs = @()
+    foreach ($proto in 'Wsman', 'Dcom') {
+        try {
+            $o = New-CimSessionOption -Protocol $proto
+            $sess = New-CimSession @opts -SessionOption $o
+            $os = Get-CimInstance -CimSession $sess -ClassName Win32_OperatingSystem -ErrorAction Stop
+            $script:Cim = $sess
+            $script:CimArgs = @{ CimSession = $sess }
+            $script:Target = $Name.Trim()
+            $script:RemoteEnv = @{
+                'windir'     = $os.WindowsDirectory
+                'systemroot' = $os.WindowsDirectory
+                'systemdrive' = $os.SystemDrive
+                'programfiles' = ($os.SystemDrive + '\Program Files')
+                'programfiles(x86)' = ($os.SystemDrive + '\Program Files (x86)')
+                'programdata' = ($os.SystemDrive + '\ProgramData')
+                'public' = ($os.SystemDrive + '\Users\Public')
+            }
+            try {
+                foreach ($e in (Get-CimInstance -CimSession $sess -ClassName Win32_Environment -Filter "UserName='<SYSTEM>'" -ErrorAction Stop)) {
+                    $k = $e.Name.ToLowerInvariant()
+                    if ($k -in 'windir','systemroot','systemdrive') { continue }   # trust Win32_OperatingSystem for these
+                    $script:RemoteEnv[$k] = $e.VariableValue
+                }
+                # One pass of nested expansion (e.g. ProgramData=%SystemDrive%\ProgramData)
+                foreach ($k in @($script:RemoteEnv.Keys)) { $script:RemoteEnv[$k] = Expand-TargetPath $script:RemoteEnv[$k] }
+            } catch {}
+            return ''
+        } catch { $errs += "$proto`: $($_.Exception.Message.Trim())" }
+    }
+    return ($errs -join "`n")
+}
+
+function Expand-TargetPath {
+    # Expand %VAR% using the target's environment. Unknown vars stay as-is.
+    param([string]$Path)
+    if (-not $script:Cim) { return [Environment]::ExpandEnvironmentVariables($Path) }
+    return [regex]::Replace($Path, '%([^%]+)%', {
+        param($m)
+        $k = $m.Groups[1].Value.ToLowerInvariant()
+        if ($script:RemoteEnv.ContainsKey($k)) { $script:RemoteEnv[$k] } else { $m.Value }
+    })
+}
+
+function Get-TargetFile {
+    # Returns @{Exists; Description; Publisher} for a full path on the target, or $null.
+    param([string]$Path)
+    if (-not $script:Cim) {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            $vi = $null; try { $vi = (Get-Item -LiteralPath $Path).VersionInfo } catch {}
+            return @{ Exists = $true; Description = $(if ($vi) { $vi.FileDescription } else { '' }); Publisher = $(if ($vi) { $vi.CompanyName } else { '' }) }
+        }
+        return $null
+    }
+    if ($Path -match '%') { return $null }   # unexpandable user variable on a remote box
+    $esc = ($Path -replace '\\', '\\') -replace "'", "\'"
+    try {
+        $f = Get-CimInstance -CimSession $script:Cim -ClassName CIM_DataFile -Filter "Name='$esc'" -ErrorAction Stop
+        if ($f) { return @{ Exists = $true; Description = ''; Publisher = [string]$f.Manufacturer } }
+    } catch {}
+    return $null
+}
+
+function Test-TargetRegistryKey {
+    param([string]$SubKey)
+    if (-not $script:Cim) {
+        $k = $null
+        try { $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($SubKey) } catch {}
+        if ($null -eq $k) { return $false }
+        $k.Close(); return $true
+    }
+    try {
+        $r = Invoke-CimMethod -CimSession $script:Cim -Namespace root/default -ClassName StdRegProv -MethodName EnumKey `
+            -Arguments @{ hDefKey = [uint32]2147483650; sSubKeyName = $SubKey } -ErrorAction Stop
+        return ($r.ReturnValue -eq 0)
+    } catch { return $false }
+}
+
+function Get-TargetRegistryString {
+    # HKLM only. Local uses .NET; remote uses StdRegProv over CIM.
+    param([string]$SubKey, [string]$Value = '')
+    if (-not $script:Cim) {
+        $k = $null
+        try { $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($SubKey) } catch {}
+        if ($null -eq $k) { return $null }
+        try { $v = $k.GetValue($Value); if ($null -ne $v) { return [string]$v } else { return '' } } finally { $k.Close() }
+    }
+    try {
+        $r = Invoke-CimMethod -CimSession $script:Cim -Namespace root/default -ClassName StdRegProv -MethodName GetStringValue `
+            -Arguments @{ hDefKey = [uint32]2147483650; sSubKeyName = $SubKey; sValueName = $Value } -ErrorAction Stop
+        if ($r.ReturnValue -eq 0) { if ($null -ne $r.sValue) { return [string]$r.sValue } else { return '' } }
+    } catch {}
+    return $null
+}
 $script:ExeCache = @{}
 $script:UrlRegex  = [regex]'(?i)\b(?:https?|ftp)://[^\s"<>]+'
 $script:HostRegex = [regex]'(?i)\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|microsoft|windows|live|office|cloud|us|gov|edu|club)\b'
@@ -86,60 +231,34 @@ function Get-TriggerSummary {
 
 $script:ComCache = @{}
 function Resolve-ComHandler {
-    # Direct .NET registry reads: the HKLM: provider is ~0.2s per miss under Classes\.
     # Returns Path (DLL/EXE), Name, and Service when the class is hosted by a Windows
-    # service via its AppID (no in-process server; that is not a defect).
+    # service via its AppID (no in-process server; that is not a defect). Works against
+    # the target's HKLM (local .NET registry, or StdRegProv over CIM when remote).
     param([string]$ClassId)
     if ($script:ComCache.ContainsKey($ClassId)) { return $script:ComCache[$ClassId] }
     $result = $null
-    $hklm = [Microsoft.Win32.Registry]::LocalMachine
-    $roots = @(
-        @{ Hive = $hklm; Sub = 'SOFTWARE\Classes\CLSID\' },
-        @{ Hive = $hklm; Sub = 'SOFTWARE\WOW6432Node\Classes\CLSID\' },
-        @{ Hive = [Microsoft.Win32.Registry]::CurrentUser; Sub = 'SOFTWARE\Classes\CLSID\' }
-    )
-    foreach ($r in $roots) {
-        $key = $null
-        try { $key = $r.Hive.OpenSubKey($r.Sub + $ClassId) } catch {}
-        if ($null -eq $key) { continue }
-        try {
-            $name = [string]$key.GetValue('')
-            foreach ($server in 'InprocServer32', 'LocalServer32') {
-                $sk = $key.OpenSubKey($server)
-                if ($null -eq $sk) { continue }
-                $path = $sk.GetValue('')
-                $sk.Close()
-                if ($path) {
-                    $result = [pscustomobject]@{ Path = [Environment]::ExpandEnvironmentVariables([string]$path); Name = $name; Service = '' }
-                    break
+    foreach ($base in 'SOFTWARE\Classes\CLSID\', 'SOFTWARE\WOW6432Node\Classes\CLSID\') {
+        if (-not (Test-TargetRegistryKey ($base + $ClassId))) { continue }     # key absent
+        $name = Get-TargetRegistryString ($base + $ClassId)
+        if ($null -eq $name) { $name = '' }
+        foreach ($server in 'InprocServer32', 'LocalServer32') {
+            $path = Get-TargetRegistryString ($base + $ClassId + '\' + $server)
+            if ($path) { $result = [pscustomobject]@{ Path = (Expand-TargetPath $path); Name = $name; Service = '' }; break }
+        }
+        if (-not $result) {
+            $appId = Get-TargetRegistryString ($base + $ClassId) 'AppID'
+            if ($appId) {
+                $svc = Get-TargetRegistryString ('SOFTWARE\Classes\AppID\' + $appId) 'LocalService'
+                if ($svc) {
+                    $img = Get-TargetRegistryString ('SYSTEM\CurrentControlSet\Services\' + $svc) 'ImagePath'
+                    if (-not $img) { $img = '' }
+                    if ($img -match '^\s*"?([^"]+?\.exe)') { $img = $Matches[1] }
+                    $result = [pscustomobject]@{ Path = (Expand-TargetPath $img); Name = $name; Service = $svc }
                 }
             }
-            if (-not $result) {
-                # Service-hosted class: CLSID -> AppID -> LocalService -> service ImagePath
-                $appId = [string]$key.GetValue('AppID')
-                if ($appId) {
-                    $ak = $null
-                    try { $ak = $hklm.OpenSubKey('SOFTWARE\Classes\AppID\' + $appId) } catch {}
-                    if ($ak) {
-                        $svc = [string]$ak.GetValue('LocalService')
-                        $ak.Close()
-                        if ($svc) {
-                            $img = ''
-                            $svk = $null
-                            try { $svk = $hklm.OpenSubKey('SYSTEM\CurrentControlSet\Services\' + $svc) } catch {}
-                            if ($svk) { $img = [string]$svk.GetValue('ImagePath'); $svk.Close() }
-                            if ($img -match '^\s*"?([^"]+?\.exe)') { $img = $Matches[1] }
-                            $result = [pscustomobject]@{ Path = [Environment]::ExpandEnvironmentVariables($img); Name = $name; Service = $svc }
-                        }
-                    }
-                }
-            }
-            if (-not $result -and $name) {
-                # Registered but with no server we can find; report the name, do not flag
-                $result = [pscustomobject]@{ Path = ''; Name = $name; Service = '' }
-            }
-        } finally { $key.Close() }
-        if ($result) { break }
+        }
+        if (-not $result) { $result = [pscustomobject]@{ Path = ''; Name = $name; Service = '' } }
+        break
     }
     $script:ComCache[$ClassId] = $result
     return $result
@@ -148,22 +267,29 @@ function Resolve-ComHandler {
 function Get-ExeInfo {
     param([string]$Path)
     if (-not $Path) { return $null }
-    $clean = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+    $clean = Expand-TargetPath ($Path.Trim().Trim('"'))
+    if ($clean -notmatch '^\\\\') { $clean = $clean -replace '\\{2,}', '\' }   # keep UNC prefix, collapse the rest
     if ($script:ExeCache.ContainsKey($clean)) { return $script:ExeCache[$clean] }
-    $info = [pscustomobject]@{ Publisher = ''; Description = ''; Signed = ''; Exists = $false; Resolved = '' }
-    $resolved = $clean
-    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
-        $cmd = Get-Command $clean -ErrorAction SilentlyContinue
-        if ($cmd -and $cmd.Source) { $resolved = $cmd.Source }
+    $info = [pscustomobject]@{ Publisher = ''; Description = ''; Signed = ''; Exists = $false; Resolved = ''; Unchecked = $false }
+    $candidates = @($clean)
+    if ($clean -notmatch '[\\/]') {
+        # Bare name such as powershell.exe: resolve like the scheduler would (System32, then PATH locally)
+        if ($script:Cim) {
+            $sysdir = Join-Path $script:RemoteEnv['windir'] 'System32'
+            $candidates = @((Join-Path $sysdir $clean), (Join-Path (Join-Path $sysdir 'WindowsPowerShell\v1.0') $clean), (Join-Path $script:RemoteEnv['windir'] $clean))
+        } else {
+            $cmd = Get-Command $clean -ErrorAction SilentlyContinue
+            if ($cmd -and $cmd.Source) { $candidates = @($cmd.Source) }
+        }
     }
-    if (Test-Path -LiteralPath $resolved -PathType Leaf) {
-        $info.Exists = $true
-        try {
-            $vi = (Get-Item -LiteralPath $resolved).VersionInfo
-            $info.Description = $vi.FileDescription
-            $info.Publisher = $vi.CompanyName
-        } catch {}
-        $info.Resolved = $resolved
+    if ($clean -match '%') { $info.Unchecked = $true }   # user-scoped variable we cannot expand remotely
+    foreach ($c in $candidates) {
+        $f = Get-TargetFile $c
+        if ($f) {
+            $info.Exists = $true; $info.Resolved = $c
+            $info.Description = [string]$f.Description; $info.Publisher = [string]$f.Publisher
+            break
+        }
     }
     $script:ExeCache[$clean] = $info
     return $info
@@ -173,6 +299,7 @@ function Get-Signer {
     # Lazy: Authenticode + catalog lookup is slow (~0.5s/file), so only on demand.
     param([string]$Path)
     $ei = Get-ExeInfo $Path
+    if ($script:Cim) { return 'not checked on remote computers' }
     if (-not $ei -or -not $ei.Exists) { return 'file not found' }
     if ($ei.Signed) { return $ei.Signed }
     try {
@@ -191,10 +318,18 @@ function Test-SidResolves {
     param([string]$Sid)
     if ($script:SidCache.ContainsKey($Sid)) { return $script:SidCache[$Sid] }
     $ok = $false
-    try {
-        $acct = (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount])
-        $ok = [bool]$acct
-    } catch { $ok = $false }
+    if ($script:Cim) {
+        try {
+            $key = New-CimInstance -ClassName Win32_SID -Property @{ SID = $Sid } -Key SID -ClientOnly
+            $obj = Get-CimInstance -CimSession $script:Cim -InputObject $key -ErrorAction Stop
+            $ok = [bool]$obj.AccountName
+        } catch { $ok = $false }
+    } else {
+        try {
+            $acct = (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount])
+            $ok = [bool]$acct
+        } catch { $ok = $false }
+    }
     $script:SidCache[$Sid] = $ok
     return $ok
 }
@@ -306,12 +441,12 @@ function Get-ResultDetail {
 
 function Get-TaskInventory {
     $rows = New-Object System.Collections.Generic.List[object]
-    $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue
+    $tasks = Get-ScheduledTask @script:CimArgs -ErrorAction SilentlyContinue
     foreach ($task in $tasks) {
         $info = $null
-        try { $info = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch {}
+        try { $info = Get-ScheduledTaskInfo @script:CimArgs -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch {}
         $xml = ''
-        try { $xml = Export-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch {}
+        try { $xml = Export-ScheduledTask @script:CimArgs -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop } catch {}
 
         $execs = @(); $argList = @(); $targets = @(); $publishers = @(); $problems = @()
         foreach ($a in @($task.Actions)) {
@@ -324,7 +459,8 @@ function Get-TaskInventory {
                 if ($ei) {
                     if ($ei.Description) { $publishers += $ei.Description }
                     if ($ei.Publisher) { $publishers += $ei.Publisher }
-                    if (-not $ei.Exists) { $publishers += 'NOT FOUND'; $problems += "missing file: $($a.Execute)" }
+                    if (-not $ei.Exists -and $ei.Unchecked) { $publishers += 'not checked (user path on remote)' }
+                    elseif (-not $ei.Exists) { $publishers += 'NOT FOUND'; $problems += "missing file: $($a.Execute)" }
                 }
             } elseif ($aKind -eq 'MSFT_TaskComHandlerAction') {
                 $com = Resolve-ComHandler $a.ClassId
@@ -336,7 +472,7 @@ function Get-TaskInventory {
                     if ($com.Path) {
                         $ei = Get-ExeInfo $com.Path
                         if ($ei -and $ei.Publisher) { $publishers += $ei.Publisher }
-                        if ($ei -and -not $ei.Exists) { $problems += "missing COM server: $($com.Path)" }
+                        if ($ei -and -not $ei.Exists -and -not $ei.Unchecked) { $problems += "missing COM server: $($com.Path)" }
                     }
                 } else { $execs += "[COM] $($a.ClassId)"; $problems += "unregistered COM class $($a.ClassId)" }
                 if ($a.Data) { $argList += $a.Data }
@@ -400,12 +536,46 @@ function Get-TaskInventory {
     return $rows
 }
 
+function Export-Inventory {
+    param([string]$Path)
+    Get-TaskInventory | Sort-Object Folder, Name |
+        Select-Object @{n='Computer';e={ if ($script:Target) { $script:Target } else { $env:COMPUTERNAME } }},
+            Folder,Name,State,Problem,LastRun,LastResult,ResultDetail,NextRun,Triggers,Action,Arguments,Publisher,Accesses,RunAs,Author,Description |
+        Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+}
+
+# Credential for a remote target, prompted once (GUI prompt; works in the exe too)
+$script:StartCred = $null
+if ($Credential) { $script:StartCred = Get-Credential -UserName $Credential -Message "Credentials for $ComputerName" }
+
+if ($Csv) {
+    # Headless: connect, export, exit. Output goes to the parent console if there is one.
+    $err = Connect-Target $ComputerName $script:StartCred
+    if ($err) { try { [Console]::Error.WriteLine("Cannot connect to $ComputerName`n$err") } catch {}; $global:TaskInspectorExit = 2; exit 2 }
+    try {
+        $dir = Split-Path -Parent $Csv
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+        Export-Inventory $Csv
+        $n = (Import-Csv $Csv).Count
+        $who = if ($script:Target) { $script:Target } else { $env:COMPUTERNAME }
+        try { [Console]::Out.WriteLine("Task Inspector: wrote $n tasks from $who to $Csv") } catch {}
+        $global:TaskInspectorExit = 0; exit 0
+    } catch {
+        try { [Console]::Error.WriteLine("Export failed: $($_.Exception.Message)") } catch {}
+        $global:TaskInspectorExit = 1; exit 1
+    }
+}
+
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Task Inspector" Height="820" Width="1500" WindowStartupLocation="CenterScreen">
   <DockPanel>
     <ToolBar DockPanel.Dock="Top">
+      <TextBlock Text="Computer:" VerticalAlignment="Center" Margin="4,0"/>
+      <TextBox x:Name="Computer" Width="170" Margin="0,0,4,0" ToolTip="Hostname, FQDN, or IP. Blank = this computer."/>
+      <Button x:Name="Connect" Content="Connect" Margin="0,0,8,0"/>
+      <Separator/>
       <TextBlock Text="Filter:" VerticalAlignment="Center" Margin="4,0"/>
       <TextBox x:Name="Filter" Width="260" Margin="0,0,8,0"/>
       <CheckBox x:Name="HideMs" Content="Hide \Microsoft\ tasks" VerticalAlignment="Center" Margin="0,0,8,0"/>
@@ -533,11 +703,11 @@ function Get-TaskInventory {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $ui = @{}
-foreach ($n in 'Filter','HideMs','OnlyNet','Nav','Tree','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
+foreach ($n in 'Computer','Connect','Filter','HideMs','OnlyNet','Nav','Tree','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
 $cm = $ui.Grid.ContextMenu
 foreach ($item in $cm.Items) { if ($item -is [System.Windows.Controls.MenuItem] -and $item.Name) { $ui[$item.Name] = $item } }
 $ui.HideMs.IsChecked = $true
-if ($script:IsAdmin) { $window.Title = 'Task Inspector (Administrator)'; $ui.Elevate.IsEnabled = $false }
+if ($script:IsAdmin) { $ui.Elevate.IsEnabled = $false }
 
 $script:All = @()
 $script:FolderFilter = '\'
@@ -634,13 +804,56 @@ function Apply-Filter {
         if ($ui.Grid.SelectedItem) { $ui.Grid.ScrollIntoView($ui.Grid.SelectedItem) }
     }
     $note = ''
-    if (-not $script:IsAdmin) { $note = '  (not elevated: SYSTEM tasks are read-only)' }
+    if (-not $script:IsAdmin -and -not $script:Cim) { $note = '  (not elevated: SYSTEM tasks are read-only)' }
+    if ($script:Cim) { $note = "  [remote: $($script:Target)]" }
     $probCount = @($script:All | Where-Object HasProblem).Count
     $where = ''; if ($script:FolderFilter -ne '\') { $where = " in $($script:FolderFilter)" }
-    $ui.Status.Text = "$($view.Count) of $($script:All.Count) tasks$where, $probCount with problems$note"
+    $counts = "$($view.Count) of $($script:All.Count) tasks$where, $probCount with problems$note"
+    if ($script:ConnectFailed -and $ui.Status.Text -like 'Could not connect*') { $ui.Status.Text = ($ui.Status.Text -split '  \| ')[0] + "  | $counts" }
+    else { $ui.Status.Text = $counts }
+}
+
+function Update-Title {
+    $who = if ($script:Target) { $script:Target } else { "$env:COMPUTERNAME (local)" }
+    $adm = if ($script:IsAdmin) { ' (Administrator)' } else { '' }
+    $window.Title = "Task Inspector - $who$adm"
+}
+
+function Connect-FromBox {
+    # Connects to whatever is in the Computer box. Returns $true on success.
+    $name = $ui.Computer.Text.Trim()
+    $cred = $script:StartCred
+    if (-not (Test-IsLocalName $name) -and $name -ne $script:Target) {
+        $ui.Status.Text = "Connecting to $name..."
+        $window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+    }
+    $err = Connect-Target $name $cred
+    if ($err -and -not $cred) {
+        # Retry once with explicit credentials
+        $cred = Get-Credential -Message "Credentials for $name (Cancel to give up)"
+        if ($cred) { $script:StartCred = $cred; $err = Connect-Target $name $cred }
+    }
+    if ($err) {
+        # Fall back to the local computer rather than blocking on a dialog
+        $null = Connect-Target '' $null
+        $ui.Computer.Text = ''
+        $short = ($err -split "`n" | Select-Object -First 1)
+        $ui.Status.Text = "Could not connect to $name ($short). Showing this computer instead."
+        $ui.Status.Foreground = [System.Windows.Media.Brushes]::Firebrick
+        $ui.Status.ToolTip = "$err`n`nWinRM must be enabled on the target (Enable-PSRemoting) or DCOM allowed through its firewall, and you need administrator rights there."
+        $script:ConnectFailed = $true
+        Update-Title
+        return $true
+    }
+    $ui.Status.Foreground = [System.Windows.Media.Brushes]::Gray
+    $ui.Status.ToolTip = $null
+    $script:ConnectFailed = $false
+    Update-Title
+    return $true
 }
 
 function Load-Tasks {
+    if (-not (Connect-FromBox)) { return }
     $ui.Status.Text = 'Loading...'
     $window.Cursor = [System.Windows.Input.Cursors]::Wait
     $window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
@@ -660,8 +873,8 @@ function Set-SelectedState {
     $ok = 0; $fail = @()
     foreach ($r in $rows) {
         try {
-            if ($Enable) { Enable-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop | Out-Null }
-            else { Disable-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop | Out-Null }
+            if ($Enable) { Enable-ScheduledTask @script:CimArgs -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop | Out-Null }
+            else { Disable-ScheduledTask @script:CimArgs -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop | Out-Null }
             $ok++
         } catch { $fail += "$($r.Name): $($_.Exception.Message.Trim())" }
     }
@@ -675,6 +888,9 @@ function Set-SelectedState {
 }
 
 $ui.Refresh.Add_Click({ Load-Tasks })
+$ui.Connect.Add_Click({ Load-Tasks })
+$ui.Computer.Add_KeyDown({ param($sender, $e) if ($e.Key -eq 'Return') { Load-Tasks } })
+if (-not (Test-IsLocalName $ComputerName)) { $ui.Computer.Text = $ComputerName.Trim() }
 $ui.Filter.Add_TextChanged({ Apply-Filter })
 $ui.HideMs.Add_Click({ Apply-Filter })
 $ui.OnlyNet.Add_Click({ Apply-Filter })
@@ -688,7 +904,7 @@ $ui.Disable.Add_Click({ Set-SelectedState -Enable:$false })
 $ui.Enable.Add_Click({ Set-SelectedState -Enable:$true })
 $ui.RunNow.Add_Click({
     foreach ($r in @($ui.Grid.SelectedItems)) {
-        try { Start-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop }
+        try { Start-ScheduledTask @script:CimArgs -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop }
         catch { [System.Windows.MessageBox]::Show($_.Exception.Message, 'Run failed') | Out-Null }
     }
     Load-Tasks
@@ -698,7 +914,8 @@ $ui.ExportCsv.Add_Click({
     $dlg.Filter = 'CSV|*.csv'
     $dlg.FileName = "scheduled-tasks-$(Get-Date -Format yyyyMMdd-HHmm).csv"
     if ($dlg.ShowDialog()) {
-        $script:All | Select-Object Folder,Name,State,Problem,LastRun,LastResult,ResultDetail,NextRun,Triggers,Action,Arguments,Publisher,Accesses,RunAs,Author,Description |
+        $script:All | Select-Object @{n='Computer';e={ if ($script:Target) { $script:Target } else { $env:COMPUTERNAME } }},
+            Folder,Name,State,Problem,LastRun,LastResult,ResultDetail,NextRun,Triggers,Action,Arguments,Publisher,Accesses,RunAs,Author,Description |
             Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
         $ui.Status.Text = "Exported to $($dlg.FileName)"
     }
@@ -706,10 +923,11 @@ $ui.ExportCsv.Add_Click({
 $ui.Elevate.Add_Click({
     # When hosted by TaskInspector.exe the host sets $TaskInspectorExe; otherwise we are a plain script.
     $exe = Get-Variable -Name TaskInspectorExe -ValueOnly -ErrorAction SilentlyContinue
+    $tgt = ''; if ($script:Target) { $tgt = " -ComputerName `"$($script:Target)`"" }
     if ($exe -and (Test-Path -LiteralPath $exe)) {
-        Start-Process -FilePath $exe -Verb RunAs
+        if ($tgt) { Start-Process -FilePath $exe -Verb RunAs -ArgumentList $tgt } else { Start-Process -FilePath $exe -Verb RunAs }
     } else {
-        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`""
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`"$tgt"
     }
     $window.Close()
 })
@@ -744,7 +962,7 @@ function Remove-SelectedTasks {
     $names = ($rows | ForEach-Object { "$($_.Folder)$($_.Name)" }) -join "`n"
     $answer = [System.Windows.MessageBox]::Show("Permanently delete $($rows.Count) task(s)?`n`n$names`n`nThis cannot be undone. Export CSV first if you want a record.", 'Delete scheduled task', 'YesNo', 'Warning')
     if ($answer -ne 'Yes') { return }
-    Invoke-OnSelected -Verb 'Delete' -Action { param($r) Unregister-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -Confirm:$false -ErrorAction Stop }
+    Invoke-OnSelected -Verb 'Delete' -Action { param($r) Unregister-ScheduledTask @script:CimArgs -TaskPath $r.Folder -TaskName $r.Name -Confirm:$false -ErrorAction Stop }
 }
 
 function Open-SelectedLocation {
@@ -753,13 +971,21 @@ function Open-SelectedLocation {
     $opened = $false
     foreach ($p in @($r.ExePaths)) {
         $ei = Get-ExeInfo $p
-        if ($ei -and $ei.Exists) { Start-Process explorer.exe -ArgumentList "/select,`"$($ei.Resolved)`""; $opened = $true; break }
+        if ($ei -and $ei.Exists) {
+            $path = $ei.Resolved
+            if ($script:Cim) { $path = '\\' + $script:Target + '\' + ($path -replace '^([A-Za-z]):', '$1$') }   # admin share
+            Start-Process explorer.exe -ArgumentList "/select,`"$path`""; $opened = $true; break
+        }
     }
     if (-not $opened) {
         # Fall back to the task definition file itself
-        $def = Join-Path $env:SystemRoot ('System32\Tasks' + $r.Folder + $r.Name)
+        if ($script:Cim) {
+            $def = '\\' + $script:Target + '\' + (($script:RemoteEnv['windir'] -replace '^([A-Za-z]):', '$1$') + '\System32\Tasks' + $r.Folder + $r.Name)
+        } else {
+            $def = Join-Path $env:SystemRoot ('System32\Tasks' + $r.Folder + $r.Name)
+        }
         if (Test-Path -LiteralPath $def) { Start-Process explorer.exe -ArgumentList "/select,`"$def`"" }
-        else { [System.Windows.MessageBox]::Show("No file found for this task's action.", 'Open file location') | Out-Null }
+        else { [System.Windows.MessageBox]::Show("No file found for this task's action.`n$def", 'Open file location') | Out-Null }
     }
 }
 
@@ -787,12 +1013,14 @@ function Get-PropertyLines {
 function Get-TaskHistory {
     param([string]$TaskPath)
     try {
-        $log = Get-WinEvent -ListLog 'Microsoft-Windows-TaskScheduler/Operational' -ErrorAction Stop
+        $ev = @{}
+        if ($script:Cim) { $ev.ComputerName = $script:Target; if ($script:RemoteCred) { $ev.Credential = $script:RemoteCred } }
+        $log = Get-WinEvent @ev -ListLog 'Microsoft-Windows-TaskScheduler/Operational' -ErrorAction Stop
         if (-not $log.IsEnabled) {
             return @([pscustomobject]@{ Time = $null; Id = ''; Level = ''; Message = 'Task history is disabled. Enable it in Task Scheduler (Actions > Enable All Tasks History).' })
         }
         $xpath = "*[EventData[Data[@Name='TaskName']='$TaskPath']]"
-        $events = Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -FilterXPath $xpath -MaxEvents 200 -ErrorAction Stop
+        $events = Get-WinEvent @ev -LogName 'Microsoft-Windows-TaskScheduler/Operational' -FilterXPath $xpath -MaxEvents 200 -ErrorAction Stop
         return @($events | ForEach-Object { [pscustomobject]@{ Time = $_.TimeCreated; Id = $_.Id; Level = $_.LevelDisplayName; Message = ($_.Message -split "`r?`n")[0] } })
     } catch {
         return @([pscustomobject]@{ Time = $null; Id = ''; Level = ''; Message = "No history: $($_.Exception.Message)" })
@@ -926,8 +1154,8 @@ $ui.CmProps.Add_Click({ Show-TaskProperties $ui.Grid.SelectedItem })
 $ui.Grid.Add_MouseDoubleClick({ Show-TaskProperties $ui.Grid.SelectedItem })
 $ui.CmEnable.Add_Click({ Set-SelectedState -Enable:$true })
 $ui.CmDisable.Add_Click({ Set-SelectedState -Enable:$false })
-$ui.CmRun.Add_Click({ Invoke-OnSelected -Verb 'Run' -Action { param($r) Start-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop } })
-$ui.CmStop.Add_Click({ Invoke-OnSelected -Verb 'Stop' -Action { param($r) Stop-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop } })
+$ui.CmRun.Add_Click({ Invoke-OnSelected -Verb 'Run' -Action { param($r) Start-ScheduledTask @script:CimArgs -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop } })
+$ui.CmStop.Add_Click({ Invoke-OnSelected -Verb 'Stop' -Action { param($r) Stop-ScheduledTask @script:CimArgs -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop } })
 $ui.CmBrowse.Add_Click({ Open-SelectedLocation })
 $ui.CmCopyPath.Add_Click({ $r = $ui.Grid.SelectedItem; if ($r) { [System.Windows.Clipboard]::SetText("$($r.Folder)$($r.Name)"); $ui.Status.Text = 'Task path copied' } })
 $ui.CmCopyCmd.Add_Click({ $r = $ui.Grid.SelectedItem; if ($r) { [System.Windows.Clipboard]::SetText(($r.Action + ' ' + $r.Arguments).Trim()); $ui.Status.Text = 'Command line copied' } })
@@ -954,5 +1182,5 @@ $ui.Grid.Add_SelectionChanged({
     $ui.XmlBox.Text = $r.Xml
 })
 
-$window.Add_ContentRendered({ Load-Tasks })
+$window.Add_ContentRendered({ Update-Title; Load-Tasks })
 $window.ShowDialog() | Out-Null

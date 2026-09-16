@@ -1,12 +1,12 @@
 # Task Inspector
 
-A single-file WPF viewer for every Windows Scheduled Task on the machine.
+A viewer for every Windows Scheduled Task on this computer or a remote one.
 
 Columns: folder, name, state, last run, last result, next run, a plain-English
 trigger summary (daily/weekly/logon/boot/event/idle, repetition interval, delay,
 automatic-maintenance period), the action (executables, with COM-handler actions
-resolved to their DLL through the registry), the file's description and
-Authenticode signer, and any URLs or hostnames found in the arguments or task XML.
+resolved to their DLL or hosting service through the registry), the file's description
+and publisher, and any URLs or hostnames found in the arguments or task XML.
 
 ## Run
 
@@ -20,11 +20,45 @@ and stamps the icon, manifest, and version info. The exe hosts PowerShell in-pro
 an STA thread: no console window, no child powershell.exe, and "Relaunch as Admin"
 re-launches the exe itself. Rebuild after editing the script. `dist\` is not committed.
 
-The script still runs on its own for development:
+The script still runs on its own for development, with the same arguments:
 
     powershell -NoProfile -ExecutionPolicy Bypass -STA -File TaskInspector.ps1
 
 or double-click `TaskInspector.vbs`. Requires Windows PowerShell 5.1 or later.
+
+## Local and remote
+
+The app opens against this computer. Type a hostname, FQDN, or IP address in the
+**Computer** box and press Connect (or Enter) to switch to another machine, as the
+Task Scheduler MMC snap-in does. The connection is a CIM session over WinRM with a
+DCOM fallback, so the target needs WinRM enabled (`Enable-PSRemoting`) or DCOM open in
+its firewall, and you need administrator rights there. If the first attempt fails you
+are asked once for credentials; if that fails too, the app **falls back to the local
+computer** and explains why in the status bar (hover it for the full error). Nothing
+blocks on a dialog.
+
+Everything works remotely: the inventory, the Problem checks (files through
+`CIM_DataFile`, COM classes and services through `StdRegProv`, SIDs through
+`Win32_SID`), enable/disable/run/stop/delete, Properties including History, and
+"Open file location" (via the target's admin share). Two differences: the Authenticode
+signer is not checked remotely, and task actions that use user-scoped variables such as
+`%LOCALAPPDATA%` cannot be expanded on another machine, so they show as "not checked"
+rather than as a problem.
+
+## Command line
+
+    TaskInspector.exe                              window, this computer
+    TaskInspector.exe <host>                       window, connected to <host>
+    TaskInspector.exe <host> <out.csv>             headless: write the inventory to CSV, exit
+    TaskInspector.exe . <out.csv>                  headless export of this computer
+    TaskInspector.exe -ComputerName <host> -Csv <out.csv> [-Credential DOMAIN\user]
+    TaskInspector.exe -Help
+
+Headless mode opens no window. The CSV has a leading `Computer` column plus every grid
+column. The exit code is 0 on success, 2 if the target cannot be reached, 1 on any
+other failure. Output is written to the console the exe was started from when there is
+one; when captured by a script, rely on the exit code and the CSV. With `-Credential`
+only the user name is given; the password is prompted for in a secure dialog.
 
 ## Controls
 

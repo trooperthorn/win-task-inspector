@@ -1,37 +1,54 @@
 // Task Inspector host. Embeds TaskInspector.ps1 as a resource and runs it in an
-// in-process PowerShell runspace on an STA thread (WPF needs STA). No console.
+// in-process PowerShell runspace on an STA thread (WPF needs STA). No console of its
+// own; in headless mode (-Csv) it attaches to the parent console so output is visible.
 using System;
 using System.IO;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("Task Inspector")]
-[assembly: AssemblyDescription("Viewer for Windows Scheduled Tasks")]
+[assembly: AssemblyDescription("Viewer for Windows Scheduled Tasks, local or remote")]
 [assembly: AssemblyCompany("Sean T. Martinez")]
 [assembly: AssemblyProduct("Task Inspector")]
 [assembly: AssemblyCopyright("MIT")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 internal static class Program
 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(int dwProcessId);
+    private const int ATTACH_PARENT_PROCESS = -1;
+
     [STAThread]
     private static int Main(string[] args)
     {
+        bool headless = false;
+        foreach (var a in args)
+        {
+            var l = a.ToLowerInvariant();
+            if (l == "-csv" || l == "-help" || l == "-?" || l == "/?" || l == "--help") headless = true;
+        }
+        if (args.Length >= 2 && !args[0].StartsWith("-") && !args[1].StartsWith("-")) headless = true; // <host> <out.csv>
+        if (headless && AttachConsole(ATTACH_PARENT_PROCESS))
+        {
+            Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+            Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+        }
+
         int exitCode = 0;
-        // Run on an explicit STA thread with a large stack; the WPF DataGrid and
-        // the PowerShell parser both like headroom.
-        var t = new Thread(() => { exitCode = Run(args); }, 16 * 1024 * 1024);
+        var t = new Thread(() => { exitCode = Run(args, headless); }, 16 * 1024 * 1024);
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
         return exitCode;
     }
 
-    private static int Run(string[] args)
+    private static int Run(string[] args, bool headless)
     {
         string script;
         var asm = Assembly.GetExecutingAssembly();
@@ -39,7 +56,7 @@ internal static class Program
         {
             if (s == null)
             {
-                MessageBox.Show("Embedded script missing. Rebuild with Build.ps1.", "Task Inspector", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Fail("Embedded script missing. Rebuild with Build.ps1.", headless);
                 return 2;
             }
             using (var r = new StreamReader(s)) script = r.ReadToEnd();
@@ -53,15 +70,27 @@ internal static class Program
         using (var rs = RunspaceFactory.CreateRunspace(iss))
         {
             rs.Open();
-            // Let the script find its own exe (used by "Relaunch as Admin").
             rs.SessionStateProxy.SetVariable("TaskInspectorExe", asm.Location);
+            rs.SessionStateProxy.SetVariable("TaskInspectorScript", script);
             using (var ps = PowerShell.Create())
             {
                 ps.Runspace = rs;
-                ps.AddScript(script, false);
+                // Invoke the script as a script block so its param() block binds the
+                // command-line arguments the way powershell.exe -File does: tokens that
+                // look like -Name are parameter names, everything else is a quoted value.
+                var cmd = new System.Text.StringBuilder("& ([scriptblock]::Create($TaskInspectorScript))");
+                foreach (var a in args)
+                {
+                    if (System.Text.RegularExpressions.Regex.IsMatch(a, @"^-[A-Za-z?][A-Za-z0-9?]*:?$") || a == "/?")
+                        cmd.Append(' ').Append(a == "/?" ? "-Help" : a);
+                    else
+                        cmd.Append(" '").Append(a.Replace("'", "''")).Append('\'');
+                }
+                ps.AddScript(cmd.ToString(), false);
                 try
                 {
                     ps.Invoke();
+                    int code = ExitCodeFrom(rs);
                     if (ps.HadErrors && ps.Streams.Error.Count > 0)
                     {
                         var sb = new System.Text.StringBuilder();
@@ -70,17 +99,41 @@ internal static class Program
                             sb.AppendLine(e.ToString());
                             if (e.InvocationInfo != null) sb.AppendLine("  at line " + e.InvocationInfo.ScriptLineNumber);
                         }
-                        MessageBox.Show(sb.ToString(), "Task Inspector: script errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        Fail(sb.ToString(), headless);
                         return 1;
                     }
+                    return code;
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show(ex.ToString(), "Task Inspector: fatal error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    // 'exit N' inside the script surfaces here as an ExitException-derived error
+                    var inner = ex.InnerException ?? ex;
+                    if (inner.GetType().Name == "ExitException") return ExitCodeFrom(rs);
+                    Fail(ex.ToString(), headless);
                     return 1;
                 }
             }
         }
-        return 0;
+    }
+
+    private static int ExitCodeFrom(Runspace rs)
+    {
+        // The script sets $global:TaskInspectorExit before calling exit.
+        var v = rs.SessionStateProxy.PSVariable.GetValue("TaskInspectorExit");
+        if (v is int) return (int)v;
+        var l = rs.SessionStateProxy.PSVariable.GetValue("LASTEXITCODE");
+        return l is int ? (int)l : 0;
+    }
+
+    private static void Fail(string message, bool headless)
+    {
+        if (headless)
+        {
+            try { Console.Error.WriteLine("Task Inspector: " + message); } catch { }
+        }
+        else
+        {
+            MessageBox.Show(message, "Task Inspector", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 }
