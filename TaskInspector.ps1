@@ -412,18 +412,19 @@ function Apply-Filter {
     $nav = 'all'
     if ($ui.Nav.SelectedItem -and $ui.Nav.SelectedItem.Tag) { $nav = [string]$ui.Nav.SelectedItem.Tag }
     $filtered = $script:All | Where-Object {
-        ($(if ($hideMs -and $nav -ne 'nonms') { $_.Folder -notlike '\Microsoft\*' } else { $true })) -and
-        ($(if ($onlyNet) { [bool]$_.Accesses } else { $true })) -and
+        $row = $_
+        ($(if ($hideMs -and $nav -ne 'nonms') { $row.Folder -notlike '\Microsoft\*' } else { $true })) -and
+        ($(if ($onlyNet) { [bool]$row.Accesses } else { $true })) -and
         ($(switch ($nav) {
             'all'      { $true }
-            'enabled'  { $_.State -ne 'Disabled' }
-            'disabled' { $_.State -eq 'Disabled' }
-            'running'  { $_.State -eq 'Running' }
-            'schedule' { @($_.TriggerKinds | Where-Object { $_ -in 'Daily','Weekly','Monthly','MonthlyDOW','Time' }).Count -gt 0 }
-            'none'     { @($_.TriggerKinds).Count -eq 0 }
-            'problems' { $_.HasProblem }
-            'nonms'    { $_.Folder -notlike '\Microsoft\*' }
-            default    { $nav -in @($_.TriggerKinds) }
+            'enabled'  { $row.State -ne 'Disabled' }
+            'disabled' { $row.State -eq 'Disabled' }
+            'running'  { $row.State -eq 'Running' }
+            'schedule' { @($row.TriggerKinds | Where-Object { $_ -in 'Daily','Weekly','Monthly','MonthlyDOW','Time' }).Count -gt 0 }
+            'none'     { @($row.TriggerKinds).Count -eq 0 }
+            'problems' { $row.HasProblem }
+            'nonms'    { $row.Folder -notlike '\Microsoft\*' }
+            default    { $nav -in @($row.TriggerKinds) }
         })) -and
         ($(if ($f) { ($_.Folder + $_.Name + $_.Action + $_.Arguments + $_.Publisher + $_.Accesses + $_.Triggers + $_.Author) -like "*$f*" } else { $true }))
     }
