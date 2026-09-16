@@ -92,6 +92,14 @@ only the user name is given; the password is prompted for in a secure dialog.
 - **Export CSV** writes the full inventory.
 - The bottom pane shows details and the raw task XML for the selected row.
 
+## Documentation
+
+- [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md): runtime requirements, everything the tool
+  can do, and how each part works (process model, data collection, remote transport,
+  result decoding, build).
+- The `build` workflow compiles the exe on every push and uploads it as an artifact;
+  pushing a `v*` tag attaches it to a GitHub Release.
+
 ## Limits
 
 "Accesses" is static: it reports targets named in the task definition, not what the

@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse-check the script
+        shell: pwsh
+        run: |
+          $errs = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile("$PWD/TaskInspector.ps1", [ref]$null, [ref]$errs)
+          if ($errs.Count) { $errs | ForEach-Object { "$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          "parse ok"
+
+      - name: Build TaskInspector.exe
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File Build.ps1
+
+      - name: Smoke test (headless local export)
+        shell: powershell
+        run: |
+          $out = "$env:RUNNER_TEMP\tasks.csv"
+          $p = Start-Process dist\TaskInspector.exe -ArgumentList ". `"$out`"" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "exit $($p.ExitCode)" }
+          $rows = @(Import-Csv $out)
+          if ($rows.Count -lt 10) { throw "only $($rows.Count) rows" }
+          "exported $($rows.Count) tasks from $($rows[0].Computer)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TaskInspector
+          path: dist/TaskInspector.exe
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/TaskInspector.exe
