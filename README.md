@@ -10,7 +10,7 @@ Authenticode signer, and any URLs or hostnames found in the arguments or task XM
 
 ## Run
 
-Double-click `TaskInspector.cmd`, or:
+Double-click `TaskInspector.vbs` (no console window), or:
 
     powershell -NoProfile -ExecutionPolicy Bypass -STA -File TaskInspector.ps1
 
@@ -23,6 +23,10 @@ Requires Windows PowerShell 5.1 or later. No modules, no install.
 - **Only with URLs/hosts** narrows to tasks whose definition names a network target.
 - **Disable / Enable / Run now** act on the selected rows (multi-select with Ctrl/Shift).
   SYSTEM-owned tasks need an elevated session; use **Relaunch as Admin**.
+- **Right-click a row** for Enable, Disable, Run now, Stop, Open file location (Explorer
+  with the action's executable selected, or the task definition under
+  `C:\Windows\System32\Tasks` if the file is gone), Copy task path, Copy command line,
+  and **Delete task** (asks for confirmation; cannot be undone).
 - **Export CSV** writes the full inventory.
 - The bottom pane shows details and the raw task XML for the selected row.
 

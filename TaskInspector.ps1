@@ -260,6 +260,20 @@ function Get-TaskInventory {
       </Grid.RowDefinitions>
       <DataGrid x:Name="Grid" Grid.Row="0" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Extended"
                 CanUserSortColumns="True" GridLinesVisibility="Horizontal" HeadersVisibility="Column" FontSize="12">
+        <DataGrid.ContextMenu>
+          <ContextMenu>
+            <MenuItem x:Name="CmEnable" Header="Enable"/>
+            <MenuItem x:Name="CmDisable" Header="Disable"/>
+            <MenuItem x:Name="CmRun" Header="Run now"/>
+            <MenuItem x:Name="CmStop" Header="Stop"/>
+            <Separator/>
+            <MenuItem x:Name="CmBrowse" Header="Open file location"/>
+            <MenuItem x:Name="CmCopyPath" Header="Copy task path"/>
+            <MenuItem x:Name="CmCopyCmd" Header="Copy command line"/>
+            <Separator/>
+            <MenuItem x:Name="CmDelete" Header="Delete task..." Foreground="DarkRed"/>
+          </ContextMenu>
+        </DataGrid.ContextMenu>
         <DataGrid.RowStyle>
           <Style TargetType="DataGridRow">
             <Style.Triggers>
@@ -301,6 +315,8 @@ $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $ui = @{}
 foreach ($n in 'Filter','HideMs','HideDisabled','OnlyNet','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
+$cm = $ui.Grid.ContextMenu
+foreach ($item in $cm.Items) { if ($item.Name) { $ui[$item.Name] = $item } }
 $ui.HideMs.IsChecked = $true
 if ($script:IsAdmin) { $window.Title = 'Task Inspector (Administrator)'; $ui.Elevate.IsEnabled = $false }
 
@@ -384,6 +400,65 @@ $ui.Elevate.Add_Click({
     Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`""
     $window.Close()
 })
+# Right-click on a row selects it (keeps an existing multi-selection if the row is already in it)
+$ui.Grid.Add_PreviewMouseRightButtonDown({
+    param($sender, $e)
+    $dep = $e.OriginalSource
+    while ($dep -and -not ($dep -is [System.Windows.Controls.DataGridRow])) { $dep = [System.Windows.Media.VisualTreeHelper]::GetParent($dep) }
+    if ($dep -and -not $dep.IsSelected) { $ui.Grid.SelectedItems.Clear(); $dep.IsSelected = $true }
+})
+
+function Invoke-OnSelected {
+    param([scriptblock]$Action, [string]$Verb)
+    $rows = @($ui.Grid.SelectedItems)
+    if ($rows.Count -eq 0) { $ui.Status.Text = 'Nothing selected'; return }
+    $ok = 0; $fail = @()
+    foreach ($r in $rows) {
+        try { & $Action $r; $ok++ } catch { $fail += "$($r.Name): $($_.Exception.Message.Trim())" }
+    }
+    Load-Tasks
+    $msg = "${Verb}: $ok succeeded"
+    if ($fail.Count) {
+        $msg += ", $($fail.Count) failed"
+        [System.Windows.MessageBox]::Show(($fail -join "`n"), "$Verb failed", 'OK', 'Warning') | Out-Null
+    }
+    $ui.Status.Text = $msg
+}
+
+function Remove-SelectedTasks {
+    $rows = @($ui.Grid.SelectedItems)
+    if ($rows.Count -eq 0) { $ui.Status.Text = 'Nothing selected'; return }
+    $names = ($rows | ForEach-Object { "$($_.Folder)$($_.Name)" }) -join "`n"
+    $answer = [System.Windows.MessageBox]::Show("Permanently delete $($rows.Count) task(s)?`n`n$names`n`nThis cannot be undone. Export CSV first if you want a record.", 'Delete scheduled task', 'YesNo', 'Warning')
+    if ($answer -ne 'Yes') { return }
+    Invoke-OnSelected -Verb 'Delete' -Action { param($r) Unregister-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -Confirm:$false -ErrorAction Stop }
+}
+
+function Open-SelectedLocation {
+    $r = $ui.Grid.SelectedItem
+    if ($null -eq $r) { return }
+    $opened = $false
+    foreach ($p in @($r.ExePaths)) {
+        $ei = Get-ExeInfo $p
+        if ($ei -and $ei.Exists) { Start-Process explorer.exe -ArgumentList "/select,`"$($ei.Resolved)`""; $opened = $true; break }
+    }
+    if (-not $opened) {
+        # Fall back to the task definition file itself
+        $def = Join-Path $env:SystemRoot ('System32\Tasks' + $r.Folder + $r.Name)
+        if (Test-Path -LiteralPath $def) { Start-Process explorer.exe -ArgumentList "/select,`"$def`"" }
+        else { [System.Windows.MessageBox]::Show("No file found for this task's action.", 'Open file location') | Out-Null }
+    }
+}
+
+$ui.CmEnable.Add_Click({ Set-SelectedState -Enable:$true })
+$ui.CmDisable.Add_Click({ Set-SelectedState -Enable:$false })
+$ui.CmRun.Add_Click({ Invoke-OnSelected -Verb 'Run' -Action { param($r) Start-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop } })
+$ui.CmStop.Add_Click({ Invoke-OnSelected -Verb 'Stop' -Action { param($r) Stop-ScheduledTask -TaskPath $r.Folder -TaskName $r.Name -ErrorAction Stop } })
+$ui.CmBrowse.Add_Click({ Open-SelectedLocation })
+$ui.CmCopyPath.Add_Click({ $r = $ui.Grid.SelectedItem; if ($r) { [System.Windows.Clipboard]::SetText("$($r.Folder)$($r.Name)"); $ui.Status.Text = 'Task path copied' } })
+$ui.CmCopyCmd.Add_Click({ $r = $ui.Grid.SelectedItem; if ($r) { [System.Windows.Clipboard]::SetText(($r.Action + ' ' + $r.Arguments).Trim()); $ui.Status.Text = 'Command line copied' } })
+$ui.CmDelete.Add_Click({ Remove-SelectedTasks })
+
 $ui.Grid.Add_SelectionChanged({
     $r = $ui.Grid.SelectedItem
     if ($null -eq $r) { $ui.Details.Text = ''; $ui.XmlBox.Text = ''; return }
