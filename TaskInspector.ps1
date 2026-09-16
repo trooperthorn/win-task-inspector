@@ -311,7 +311,13 @@ function Get-TaskInventory {
       <Button x:Name="Elevate" Content="Relaunch as Admin" Margin="4,0"/>
       <TextBlock x:Name="Status" VerticalAlignment="Center" Margin="12,0" Foreground="Gray"/>
     </ToolBar>
-    <Grid DockPanel.Dock="Left" Width="240" Margin="0,0,4,0">
+    <Grid>
+     <Grid.ColumnDefinitions>
+       <ColumnDefinition Width="260" MinWidth="120"/>
+       <ColumnDefinition Width="6"/>
+       <ColumnDefinition Width="*"/>
+     </Grid.ColumnDefinitions>
+    <Grid Grid.Column="0" Margin="0,0,2,0">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
@@ -338,7 +344,8 @@ function Get-TaskInventory {
       <TextBlock Grid.Row="2" Text="Task Scheduler Library" FontWeight="Bold" Margin="6,10,0,2"/>
       <TreeView x:Name="Tree" Grid.Row="3" FontSize="13" BorderThickness="0"/>
     </Grid>
-    <Grid>
+    <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Background="#DDD"/>
+    <Grid Grid.Column="2">
       <Grid.RowDefinitions>
         <RowDefinition Height="3*"/>
         <RowDefinition Height="5"/>
@@ -401,6 +408,7 @@ function Get-TaskInventory {
         </TabItem>
       </TabControl>
     </Grid>
+    </Grid>
   </DockPanel>
 </Window>
 "@
@@ -420,8 +428,18 @@ $script:FolderFilter = '\'
 function Build-FolderTree {
     # One node per folder that exists in the task list (Task Scheduler Library layout);
     # header shows the number of tasks directly in that folder.
+    # Direct counts per folder, then cumulative counts (folder + every subfolder)
     $counts = @{}
     foreach ($r in $script:All) { $counts[$r.Folder] = 1 + $(if ($counts.ContainsKey($r.Folder)) { $counts[$r.Folder] } else { 0 }) }
+    $totals = @{}
+    foreach ($folder in $counts.Keys) {
+        $parts = $folder.Trim('\') -split '\\' | Where-Object { $_ }
+        $path = '\'
+        foreach ($part in $parts) {
+            $path = $path + $part + '\'
+            $totals[$path] = $counts[$folder] + $(if ($totals.ContainsKey($path)) { $totals[$path] } else { 0 })
+        }
+    }
     $nodes = @{}
     $root = New-Object System.Windows.Controls.TreeViewItem
     $root.Header = "Task Scheduler Library ($($script:All.Count))"
@@ -436,7 +454,7 @@ function Build-FolderTree {
             $path = $path + $part + '\'
             if (-not $nodes.ContainsKey($path)) {
                 $n = New-Object System.Windows.Controls.TreeViewItem
-                $c = 0; if ($counts.ContainsKey($path)) { $c = $counts[$path] }
+                $c = 0; if ($totals.ContainsKey($path)) { $c = $totals[$path] }
                 $n.Header = "$part ($c)"
                 $n.Tag = $path
                 $n.IsExpanded = ($path -eq '\Microsoft\')

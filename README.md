@@ -21,8 +21,9 @@ Requires Windows PowerShell 5.1 or later. No modules, no install.
 - **Left pane** picks a view: all, enabled, disabled, running, or by trigger type
   (logon, startup, idle, schedule, event, on demand), plus Problems and Non-Microsoft.
   Below it, **Task Scheduler Library** is the folder tree; selecting a folder shows its
-  tasks and every subfolder's tasks, combined with the view above. Counts in the tree are
-  tasks directly in that folder. Selecting a folder overrides "Hide \Microsoft\ tasks".
+  tasks and every subfolder's tasks, combined with the view above. Counts in the tree
+  include subfolders. Drag the divider to resize the pane. Selecting a folder overrides
+  "Hide \Microsoft\ tasks".
 - **Properties** (right-click, or double-click a row) opens a read-only window with the
   same tabs as Task Scheduler: General, Triggers, Actions, Conditions, Settings,
   History (from the TaskScheduler/Operational log, if history is enabled), and XML.
