@@ -311,22 +311,33 @@ function Get-TaskInventory {
       <Button x:Name="Elevate" Content="Relaunch as Admin" Margin="4,0"/>
       <TextBlock x:Name="Status" VerticalAlignment="Center" Margin="12,0" Foreground="Gray"/>
     </ToolBar>
-    <ListBox x:Name="Nav" DockPanel.Dock="Left" Width="190" Margin="0,0,4,0" FontSize="13" SelectedIndex="0">
-      <ListBoxItem Content="All tasks" Tag="all"/>
-      <ListBoxItem Content="Enabled" Tag="enabled"/>
-      <ListBoxItem Content="Disabled" Tag="disabled"/>
-      <ListBoxItem Content="Running now" Tag="running"/>
-      <Separator/>
-      <ListBoxItem Content="Run at logon" Tag="Logon"/>
-      <ListBoxItem Content="Run at startup" Tag="Boot"/>
-      <ListBoxItem Content="Run when idle" Tag="Idle"/>
-      <ListBoxItem Content="Run on a schedule" Tag="schedule"/>
-      <ListBoxItem Content="Run on an event" Tag="Event"/>
-      <ListBoxItem Content="No trigger (on demand)" Tag="none"/>
-      <Separator/>
-      <ListBoxItem Content="Problems" Tag="problems" Foreground="#C62828"/>
-      <ListBoxItem Content="Non-Microsoft" Tag="nonms"/>
-    </ListBox>
+    <Grid DockPanel.Dock="Left" Width="240" Margin="0,0,4,0">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+      </Grid.RowDefinitions>
+      <TextBlock Grid.Row="0" Text="Views" FontWeight="Bold" Margin="6,4,0,2"/>
+      <ListBox x:Name="Nav" Grid.Row="1" FontSize="13" SelectedIndex="0" BorderThickness="0">
+        <ListBoxItem Content="All tasks" Tag="all"/>
+        <ListBoxItem Content="Enabled" Tag="enabled"/>
+        <ListBoxItem Content="Disabled" Tag="disabled"/>
+        <ListBoxItem Content="Running now" Tag="running"/>
+        <Separator/>
+        <ListBoxItem Content="Run at logon" Tag="Logon"/>
+        <ListBoxItem Content="Run at startup" Tag="Boot"/>
+        <ListBoxItem Content="Run when idle" Tag="Idle"/>
+        <ListBoxItem Content="Run on a schedule" Tag="schedule"/>
+        <ListBoxItem Content="Run on an event" Tag="Event"/>
+        <ListBoxItem Content="No trigger (on demand)" Tag="none"/>
+        <Separator/>
+        <ListBoxItem Content="Problems" Tag="problems" Foreground="#C62828"/>
+        <ListBoxItem Content="Non-Microsoft" Tag="nonms"/>
+      </ListBox>
+      <TextBlock Grid.Row="2" Text="Task Scheduler Library" FontWeight="Bold" Margin="6,10,0,2"/>
+      <TreeView x:Name="Tree" Grid.Row="3" FontSize="13" BorderThickness="0"/>
+    </Grid>
     <Grid>
       <Grid.RowDefinitions>
         <RowDefinition Height="3*"/>
@@ -397,13 +408,48 @@ function Get-TaskInventory {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $ui = @{}
-foreach ($n in 'Filter','HideMs','OnlyNet','Nav','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
+foreach ($n in 'Filter','HideMs','OnlyNet','Nav','Tree','Refresh','Disable','Enable','RunNow','ExportCsv','Elevate','Status','Grid','Details','XmlBox') { $ui[$n] = $window.FindName($n) }
 $cm = $ui.Grid.ContextMenu
 foreach ($item in $cm.Items) { if ($item -is [System.Windows.Controls.MenuItem] -and $item.Name) { $ui[$item.Name] = $item } }
 $ui.HideMs.IsChecked = $true
 if ($script:IsAdmin) { $window.Title = 'Task Inspector (Administrator)'; $ui.Elevate.IsEnabled = $false }
 
 $script:All = @()
+$script:FolderFilter = '\'
+
+function Build-FolderTree {
+    # One node per folder that exists in the task list (Task Scheduler Library layout);
+    # header shows the number of tasks directly in that folder.
+    $counts = @{}
+    foreach ($r in $script:All) { $counts[$r.Folder] = 1 + $(if ($counts.ContainsKey($r.Folder)) { $counts[$r.Folder] } else { 0 }) }
+    $nodes = @{}
+    $root = New-Object System.Windows.Controls.TreeViewItem
+    $root.Header = "Task Scheduler Library ($($script:All.Count))"
+    $root.Tag = '\'
+    $root.IsExpanded = $true
+    $nodes['\'] = $root
+    foreach ($folder in ($counts.Keys | Sort-Object)) {
+        $parts = $folder.Trim('\') -split '\\' | Where-Object { $_ }
+        $path = '\'
+        foreach ($part in $parts) {
+            $parentNode = $nodes[$path]
+            $path = $path + $part + '\'
+            if (-not $nodes.ContainsKey($path)) {
+                $n = New-Object System.Windows.Controls.TreeViewItem
+                $c = 0; if ($counts.ContainsKey($path)) { $c = $counts[$path] }
+                $n.Header = "$part ($c)"
+                $n.Tag = $path
+                $n.IsExpanded = ($path -eq '\Microsoft\')
+                $parentNode.Items.Add($n) | Out-Null
+                $nodes[$path] = $n
+            }
+        }
+    }
+    $ui.Tree.Items.Clear()
+    $ui.Tree.Items.Add($root) | Out-Null
+    # Re-select the folder that was active before a refresh
+    if ($nodes.ContainsKey($script:FolderFilter)) { $nodes[$script:FolderFilter].IsSelected = $true } else { $script:FolderFilter = '\'; $root.IsSelected = $true }
+}
 
 function Apply-Filter {
     $f = $ui.Filter.Text
@@ -413,7 +459,8 @@ function Apply-Filter {
     if ($ui.Nav.SelectedItem -and $ui.Nav.SelectedItem.Tag) { $nav = [string]$ui.Nav.SelectedItem.Tag }
     $filtered = $script:All | Where-Object {
         $row = $_
-        ($(if ($hideMs -and $nav -ne 'nonms') { $row.Folder -notlike '\Microsoft\*' } else { $true })) -and
+        ($row.Folder -like ($script:FolderFilter + '*')) -and
+        ($(if ($hideMs -and $nav -ne 'nonms' -and $script:FolderFilter -eq '\') { $row.Folder -notlike '\Microsoft\*' } else { $true })) -and
         ($(if ($onlyNet) { [bool]$row.Accesses } else { $true })) -and
         ($(switch ($nav) {
             'all'      { $true }
@@ -454,7 +501,8 @@ function Apply-Filter {
     $note = ''
     if (-not $script:IsAdmin) { $note = '  (not elevated: SYSTEM tasks are read-only)' }
     $probCount = @($script:All | Where-Object HasProblem).Count
-    $ui.Status.Text = "$($view.Count) of $($script:All.Count) tasks, $probCount with problems$note"
+    $where = ''; if ($script:FolderFilter -ne '\') { $where = " in $($script:FolderFilter)" }
+    $ui.Status.Text = "$($view.Count) of $($script:All.Count) tasks$where, $probCount with problems$note"
 }
 
 function Load-Tasks {
@@ -463,6 +511,9 @@ function Load-Tasks {
     $window.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
     $script:All = @(Get-TaskInventory | Sort-Object Folder, Name)
     $window.Cursor = $null
+    $script:SuppressTree = $true
+    Build-FolderTree
+    $script:SuppressTree = $false
     Apply-Filter
 }
 
@@ -492,6 +543,11 @@ $ui.Refresh.Add_Click({ Load-Tasks })
 $ui.Filter.Add_TextChanged({ Apply-Filter })
 $ui.HideMs.Add_Click({ Apply-Filter })
 $ui.OnlyNet.Add_Click({ Apply-Filter })
+$ui.Tree.Add_SelectedItemChanged({
+    if ($script:SuppressTree) { return }
+    $n = $ui.Tree.SelectedItem
+    if ($n -and $n.Tag) { $script:FolderFilter = [string]$n.Tag; Apply-Filter }
+})
 $ui.Nav.Add_SelectionChanged({ if ($ui.Nav.SelectedItem -is [System.Windows.Controls.ListBoxItem]) { Apply-Filter } })
 $ui.Disable.Add_Click({ Set-SelectedState -Enable:$false })
 $ui.Enable.Add_Click({ Set-SelectedState -Enable:$true })
